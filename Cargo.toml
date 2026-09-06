@@ -1,0 +1,34 @@
+[package]
+name = "solfege-stretching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Time stretching, pitch shifting and warping engine (offline + real-time contract)"
+
+[lib]
+name = "solfege"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solfege"
+path = "src/bin/solfege.rs"
+
+[[bin]]
+name = "solfege-demo"
+path = "src/bin/solfege_demo.rs"
+required-features = ["demo"]
+
+[features]
+default = []
+playback = ["dep:cpal"]
+demo = ["playback", "dep:eframe"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustfft = "6"
+realfft = "3"
+eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+cpal = { version = "0.15", optional = true }
+
+[dev-dependencies]
