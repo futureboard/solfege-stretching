@@ -9,31 +9,26 @@
 use crate::analysis::{Analysis, ContentClass};
 use crate::audio::Fnv1a128;
 use crate::document::{EditDocument, EngineMode, FormantPolicy, QualityProfile};
+use crate::engines::elastic::{ElasticEngine, ElasticPreset};
 use crate::engines::{
-    bypass::BypassEngine, percussive::PercussiveEngine, pitch::PitchStage, pv::PvEngine,
-    tape::TapeEngine, texture::TextureEngine, wsola::WsolaEngine,
+    bypass::BypassEngine, pitch::PitchStage, soloist::SoloistEngine, tape::TapeEngine,
+    texture::TextureEngine,
 };
-use crate::engines::{Capability, PrepareError, PreparedConfig, ProtectWindow, StretchEngine};
+use crate::engines::{Capability, PrepareError, PreparedConfig, StretchEngine};
 use crate::mapping::TimeMap;
 use std::fmt;
 
 /// Engine build version, part of the render cache key.
-pub const ENGINE_VERSION: u32 = 1;
+pub const ENGINE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanError {
     Document(String),
-    /// Protected attacks do not fit in the output span the map asks for.
-    ConstraintConflict {
-        segment: usize,
-        protected_frames: u64,
-        output_frames: u64,
-        source_frames: u64,
-    },
     /// Both controls are individually in range but their product is not.
     InternalRatio { alpha: f64, pitch: f64, internal: f64, min: f64, max: f64 },
     Prepare(PrepareError),
-    /// Tape ties pitch to the map, so a separate transpose is a contradiction.
+    /// Varispeed ties pitch to the map, so a separate transpose is a
+    /// contradiction.
     TapePitchConflict { semitones: f64 },
     FormantUnsupported { mode: EngineMode },
     GroupMismatch(String),
@@ -43,18 +38,6 @@ impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanError::Document(e) => write!(f, "{e}"),
-            PlanError::ConstraintConflict {
-                segment,
-                protected_frames,
-                output_frames,
-                source_frames,
-            } => write!(
-                f,
-                "segment {segment}: {protected_frames} protected frames do not fit in \
-                 {output_frames} output frames (from {source_frames} source frames). \
-                 Shorten the protection or accept less of it; the render will not \
-                 silently drop a hit."
-            ),
             PlanError::InternalRatio { alpha, pitch, internal, min, max } => write!(
                 f,
                 "alpha {alpha:.3} with pitch x{pitch:.3} needs an internal stretch of \
@@ -63,12 +46,12 @@ impl fmt::Display for PlanError {
             PlanError::Prepare(e) => write!(f, "{e}"),
             PlanError::TapePitchConflict { semitones } => write!(
                 f,
-                "Tape derives pitch from the time map; it cannot also transpose by \
-                 {semitones:+.2} semitones. Use Monophonic or Polyphonic for independent pitch."
+                "Varispeed derives pitch from the time map; it cannot also transpose by \
+                 {semitones:+.2} semitones. Use an Elastic mode or Soloist for independent pitch."
             ),
             PlanError::FormantUnsupported { mode } => write!(
                 f,
-                "{} has no formant path; only Polyphonic and Hybrid do",
+                "{} has no formant path; the Elastic modes and Soloist do",
                 mode.label()
             ),
             PlanError::GroupMismatch(m) => write!(f, "group members do not line up: {m}"),
@@ -111,222 +94,31 @@ impl RenderPlan {
 #[derive(Clone, Debug)]
 pub struct CompileOptions {
     pub max_block: usize,
-    /// Attack length protected around each promoted onset, in seconds.
-    pub protect_seconds: f64,
-    /// Use detected onsets as protections even when the mode is not Percussive.
-    pub protect_in_spectral_modes: bool,
-    /// Override the spectral window. `None` keeps the engine's own choice.
+    /// Transient handling. `false` turns detection and locking off entirely,
+    /// so "off" really is off rather than a very short protection.
+    pub transient_protect: bool,
+    /// Override the spectral window. `None` keeps the preset's choice.
     pub stft_size: Option<usize>,
-    /// Override the low path's window; `Some(0)` turns the path off.
-    pub low_stft_size: Option<usize>,
-    pub low_gate: bool,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
-        Self {
-            max_block: 4096,
-            protect_seconds: 0.012,
-            protect_in_spectral_modes: true,
-            stft_size: None,
-            low_stft_size: None,
-            // Off, and the reason is in `engines::pv`: handing the bass back
-            // and forth between two independent phase evolutions is a
-            // time-varying comb filter, and it measured far worse than either
-            // side of the switch. Kept as a knob for a future design that
-            // makes the two bands phase-coherent.
-            low_gate: false,
-        }
+        Self { max_block: 4096, transient_protect: true, stft_size: None }
     }
 }
 
-/// Pick the spectral window from what the analysis found.
-///
-/// Window length is the one PV parameter with two opposed jobs (dsp.md sec.5):
-/// long enough to resolve the partials of the lowest note present, short enough
-/// to keep an attack where it was. Neither is a constant of the algorithm, they
-/// are properties of the material, so the compiler reads them off the analysis
-/// instead of pinning a number.
-///
-/// * **Bass** sets the floor. Partials sit `f0` apart, which is `f0*N/rate`
-///   bins, and peak locking needs a few bins between them to tell one partial
-///   from the next - so `N >= BINS_PER_PARTIAL * rate / f0`.
-/// * **Percussivity** sets the ceiling. Material with real attacks in it gets
-///   the shorter window, because a smeared hit is more obvious than a slightly
-///   rough bass note.
-///
-/// This is adaptive *per plan*, not multi-resolution per band: one window for
-/// the whole render. True multi-resolution is the backlog item dsp.md sec.2
-/// lists, and calling this that would be an overclaim.
-const BINS_PER_PARTIAL: f64 = 3.5;
-/// Bins the main window must place across the crossover transition so the two
-/// bands draw the same curve and sum back to unity.
-const CROSSOVER_BINS: f64 = 5.0;
-
-pub fn choose_stft_size(
-    analysis: Option<&Analysis>,
-    sample_rate: u32,
-    quality: QualityProfile,
-    hybrid: bool,
-    low_band: bool,
-) -> Option<usize> {
-    let a = analysis?;
-    let base: usize = match quality {
-        QualityProfile::Offline => 2048,
-        QualityProfile::Realtime => 1024,
-    };
-    // Lowest fundamental worth designing for: the 10th percentile of confident
-    // detections, so one bad octave estimate cannot drag the window out.
-    let mut lows: Vec<f64> = a
-        .notes
-        .iter()
-        .filter(|n| n.confidence > 0.6 && n.median_hz > 20.0)
-        .map(|n| n.median_hz)
-        .collect();
-    if lows.is_empty() {
-        return None;
-    }
-    lows.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let f0_low = lows[lows.len() / 10];
-
-    // With the specialised low path running, the bass is no longer this
-    // window's problem - but the crossover is. The two bands only add back to
-    // unity if both can draw the same transition, and a window that spans the
-    // 60 Hz transition in two bins draws it as a step: on a real master that
-    // showed up as +3.01 dBFS of peak against +1.32 for a window one size up,
-    // purely from ripple in the overlap. So the floor comes from the transition
-    // width, not from the lowest note.
-    let need = if low_band {
-        let transition = crate::engines::pv::CROSSOVER_HI_HZ - crate::engines::pv::CROSSOVER_LO_HZ;
-        (CROSSOVER_BINS * sample_rate as f64 / transition).ceil() as usize
-    } else {
-        (BINS_PER_PARTIAL * sample_rate as f64 / f0_low).ceil() as usize
-    };
-    let mut n = need.next_power_of_two().max(base);
-    // Attacks win over bass when there are attacks.
-    if a.percussivity > 0.10 {
-        n = n.min(base);
-    }
-    if hybrid && !low_band {
-        // The separation needs more resolution than the synthesis; see the
-        // window note in `engines::pv`. Not when the low path is running,
-        // though: HPSS is then only asked about frequencies above the
-        // crossover, where partials are already far enough apart, and doubling
-        // here would both cost every attack and push the main window up to the
-        // low path's own size - which would disable it.
-        n *= 2;
-    }
-    Some(n.clamp(512, 8192))
-}
-
-/// Should the specialised low path run, and with what window?
-///
-/// `Some(0)` disables it. The path resolves a bass fundamental far better than
-/// the main window can - a 82.5 Hz tone measured 0.23 cents of wobble without
-/// it and 0.05 with - but its window is long enough to smear a low-frequency
-/// attack, and the two cannot be crossfaded (see `engines::pv`). So the
-/// decision is made once, from the material, and never switched mid-render.
-///
-/// Two things turn it off: no bass to help, and low-frequency transients to
-/// ruin. On a pure drum fixture the attack rise went from 2.36 ms to 9.09 ms
-/// with the path on, while on bass with drums over it the low end got *smoother*
-/// (0.28 to 0.14 dB rms of envelope roughness). Percussivity separates those.
-pub fn choose_low_stft_size(
-    analysis: Option<&Analysis>,
-    sample_rate: u32,
-    quality: QualityProfile,
-) -> Option<usize> {
-    let a = analysis?;
-    let mut lows: Vec<f64> = a
-        .notes
-        .iter()
-        .filter(|n| n.confidence > 0.6 && n.median_hz > 20.0)
-        .map(|n| n.median_hz)
-        .collect();
-    if lows.is_empty() {
-        return Some(0);
-    }
-    lows.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let f0_low = lows[lows.len() / 10];
-    if f0_low > crate::engines::pv::CROSSOVER_HI_HZ {
-        // Nothing lives below the crossover; the path would only cost CPU.
-        return Some(0);
-    }
-    if a.percussivity > 0.10 {
-        return Some(0);
-    }
-    let n = match quality {
-        QualityProfile::Offline => 8192,
-        QualityProfile::Realtime => 4096,
-    };
-    Some(if sample_rate > 60_000 { n * 2 } else { n })
-}
-
-/// Merge overlapping protection windows. dsp.md sec.6 requires this *before*
-/// the feasibility arithmetic, otherwise overlapping attacks are counted twice.
-pub fn merge_protections(mut windows: Vec<ProtectWindow>) -> Vec<ProtectWindow> {
-    windows.retain(|w| !w.is_empty());
-    windows.sort_by_key(|w| w.start);
-    let mut out: Vec<ProtectWindow> = Vec::with_capacity(windows.len());
-    for w in windows {
-        match out.last_mut() {
-            Some(last) if w.start <= last.end => {
-                last.end = last.end.max(w.end);
-            }
-            _ => out.push(w),
-        }
-    }
-    out
-}
-
-/// `alpha_sustain = (L_out - P) / (L_in - P)`, valid only while both sides stay
-/// positive (dsp.md sec.6).
-pub fn sustain_ratio(l_in: u64, l_out: u64, protected: u64) -> Option<f64> {
-    if l_in <= protected || l_out <= protected {
-        return None;
-    }
-    Some((l_out - protected) as f64 / (l_in - protected) as f64)
-}
-
-fn check_protections(map: &TimeMap, protections: &[ProtectWindow]) -> Result<(), PlanError> {
-    for i in 0..map.segment_count() {
-        let a = map.anchors()[i];
-        let b = map.anchors()[i + 1];
-        let l_in = b.source_frame - a.source_frame;
-        let l_out = b.output_frame - a.output_frame;
-        let protected: u64 = protections
-            .iter()
-            .map(|p| {
-                let s = p.start.max(a.source_frame);
-                let e = p.end.min(b.source_frame);
-                e.saturating_sub(s)
-            })
-            .sum();
-        if protected == 0 {
-            continue;
-        }
-        if sustain_ratio(l_in, l_out, protected).is_none() {
-            return Err(PlanError::ConstraintConflict {
-                segment: i,
-                protected_frames: protected,
-                output_frames: l_out,
-                source_frames: l_in,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn capability_of(mode: EngineMode) -> Capability {
+pub fn capability_of(mode: EngineMode) -> Capability {
     match mode {
         EngineMode::Bypass => BypassEngine::CAPABILITY,
-        EngineMode::Tape => TapeEngine::CAPABILITY,
-        EngineMode::Percussive => PercussiveEngine::CAPABILITY,
-        EngineMode::Monophonic => WsolaEngine::CAPABILITY,
-        EngineMode::Polyphonic => PvEngine::CAPABILITY,
-        EngineMode::Hybrid => Capability { name: "hybrid", ..PvEngine::CAPABILITY },
+        EngineMode::Varispeed => TapeEngine::CAPABILITY,
+        EngineMode::ElasticPro => Capability { name: "elastic pro", ..ElasticEngine::CAPABILITY },
+        EngineMode::ElasticEfficient => {
+            Capability { name: "elastic efficient", ..ElasticEngine::CAPABILITY }
+        }
+        EngineMode::Rhythmic => Capability { name: "rhythmic", ..ElasticEngine::CAPABILITY },
+        EngineMode::Soloist => SoloistEngine::CAPABILITY,
         EngineMode::Texture => TextureEngine::CAPABILITY,
-        EngineMode::Auto => WsolaEngine::CAPABILITY,
+        EngineMode::Auto => ElasticEngine::CAPABILITY,
     }
 }
 
@@ -336,19 +128,17 @@ fn route_auto(doc: &EditDocument, analysis: Option<&Analysis>, map: &TimeMap) ->
     }
     let Some(a) = analysis else {
         return (
-            EngineMode::Monophonic,
-            "no analysis available: WSOLA is the safe baseline".to_string(),
+            EngineMode::ElasticPro,
+            "no analysis yet: Elastic Pro handles any material".to_string(),
         );
     };
-    let mode = a.class.suggested_mode();
+    let mut mode = a.class.suggested_mode();
     let (lo, hi) = map.ratio_range();
-    // A large ratio on percussive material still wants slicing, but a very
-    // large one on tonal material is better served spectrally.
-    let mode = if mode == EngineMode::Monophonic && (hi > 2.0 || lo < 0.5) {
-        EngineMode::Polyphonic
-    } else {
-        mode
-    };
+    // Soloist is built for one voice at moderate ratios; far outside that
+    // the spectral engine degrades more gracefully.
+    if mode == EngineMode::Soloist && (hi > 3.0 || lo < 0.33) {
+        mode = EngineMode::ElasticPro;
+    }
     let reason = format!(
         "{} (percussivity {:.2}, tonality {:.2}, ratio {:.2}..{:.2})",
         a.class.label(),
@@ -377,7 +167,7 @@ pub fn compile(
         (doc.mode, None)
     };
 
-    if mode == EngineMode::Tape && doc.pitch_semitones != 0.0 {
+    if mode == EngineMode::Varispeed && doc.pitch_semitones != 0.0 {
         return Err(PlanError::TapePitchConflict { semitones: doc.pitch_semitones });
     }
 
@@ -386,38 +176,14 @@ pub fn compile(
         return Err(PlanError::FormantUnsupported { mode });
     }
 
-    // Protections: promoted onsets, merged, clipped to the source.
-    let want_protect = matches!(mode, EngineMode::Percussive)
-        || (opts.protect_in_spectral_modes
-            && matches!(mode, EngineMode::Polyphonic | EngineMode::Hybrid | EngineMode::Monophonic));
-    let protections = if want_protect {
-        let len = (doc.source.sample_rate as f64 * opts.protect_seconds).round() as u64;
-        let windows: Vec<ProtectWindow> = analysis
-            .map(|a| {
-                a.onsets
-                    .iter()
-                    .map(|o| ProtectWindow {
-                        start: o.frame,
-                        end: (o.frame + len).min(doc.source.frames),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        merge_protections(windows)
-    } else {
-        Vec::new()
-    };
-
-    if mode == EngineMode::Percussive {
-        check_protections(&map, &protections)?;
-    }
-
-    // The internal ratio is what the engine actually has to realise.
+    // Only the engines that transpose by stretch-then-resample see an
+    // internal ratio of alpha*p; the Elastic modes and Soloist shift pitch
+    // natively, so their stretch is just alpha.
     let (lo, hi) = map.ratio_range();
-    let (ilo, ihi) = (lo * pitch, hi * pitch);
-    if ilo < cap.min_ratio || ihi > cap.max_ratio {
-        let (alpha, internal) =
-            if ilo < cap.min_ratio { (lo, ilo) } else { (hi, ihi) };
+    let resampled = mode == EngineMode::Texture && pitch != 1.0;
+    let (ilo, ihi) = if resampled { (lo * pitch, hi * pitch) } else { (lo, hi) };
+    if map.source_frames().get() > 0 && (ilo < cap.min_ratio || ihi > cap.max_ratio) {
+        let (alpha, internal) = if ilo < cap.min_ratio { (lo, ilo) } else { (hi, ihi) };
         return Err(PlanError::InternalRatio {
             alpha,
             pitch,
@@ -426,32 +192,13 @@ pub fn compile(
             max: cap.max_ratio,
         });
     }
-
-    // The low path is decided first, because whether it runs changes what the
-    // main window has to cover.
-    let low_stft_size = opts.low_stft_size.or_else(|| {
-        if matches!(mode, EngineMode::Polyphonic | EngineMode::Hybrid) {
-            choose_low_stft_size(analysis, doc.source.sample_rate, doc.quality)
-        } else {
-            None
-        }
-    });
-    let low_running = low_stft_size.map(|v| v > 0).unwrap_or(false);
-
-    // An explicit override wins; otherwise let the material choose.
-    let stft_size = opts.stft_size.or_else(|| {
-        if matches!(mode, EngineMode::Polyphonic | EngineMode::Hybrid) {
-            choose_stft_size(
-                analysis,
-                doc.source.sample_rate,
-                doc.quality,
-                mode == EngineMode::Hybrid,
-                low_running,
-            )
-        } else {
-            None
-        }
-    });
+    if cap.independent_pitch && !(0.25..=4.0).contains(&pitch) {
+        return Err(PlanError::Prepare(PrepareError::UnsupportedPitch {
+            requested: pitch,
+            min: 0.25,
+            max: 4.0,
+        }));
+    }
 
     let cfg = PreparedConfig {
         sample_rate: doc.source.sample_rate,
@@ -460,14 +207,10 @@ pub fn compile(
         pitch,
         formant: doc.formant,
         quality: doc.quality,
-        protections,
-        protect_frames: (doc.source.sample_rate as f64 * opts.protect_seconds).round() as u64,
-        transient_protect: opts.protect_seconds > 0.0,
+        transient_protect: opts.transient_protect,
         max_block: opts.max_block,
         seed: doc.deterministic_seed,
-        stft_size,
-        low_stft_size,
-        low_gate: opts.low_gate,
+        stft_size: opts.stft_size,
     };
 
     let render_key = render_key(doc, &mode, opts);
@@ -483,35 +226,33 @@ pub fn render_key(doc: &EditDocument, mode: &EngineMode, opts: &CompileOptions) 
     h.write_str(mode.label());
     h.write_str(doc.quality.label());
     h.write_u64(doc.deterministic_seed);
-    h.write_f64(opts.protect_seconds);
+    h.write_u64(opts.transient_protect as u64);
     h.write_u64(opts.max_block as u64);
     h.write_u64(opts.stft_size.unwrap_or(0) as u64);
-    h.write_u64(opts.low_stft_size.map(|v| v as u64 + 1).unwrap_or(0));
-    h.write_u64(opts.low_gate as u64);
     h.finish_hex()
 }
 
-/// Build and prepare the engine chain for a plan.
+/// Build and prepare the engine for a plan.
 ///
-/// Transposition is a separate stage wrapped around the stretch engine, so no
-/// engine has to know about both clocks. When `p == 1` the stage is left out
-/// entirely, which is what keeps Bypass sample-exact.
+/// The Elastic modes and Soloist transpose natively. Texture still transposes
+/// by stretch-then-resample through [`PitchStage`]; when `p == 1` the stage is
+/// left out entirely.
 pub fn build_engine(plan: &RenderPlan) -> Result<Box<dyn StretchEngine>, PlanError> {
-    let inner: Box<dyn StretchEngine> = match plan.mode {
+    let mut engine: Box<dyn StretchEngine> = match plan.mode {
         EngineMode::Bypass => Box::new(BypassEngine::new()),
-        EngineMode::Tape => Box::new(TapeEngine::new()),
-        EngineMode::Percussive => Box::new(PercussiveEngine::new()),
-        EngineMode::Monophonic => Box::new(WsolaEngine::new()),
-        EngineMode::Polyphonic => Box::new(PvEngine::new()),
-        EngineMode::Hybrid => Box::new(PvEngine::hybrid()),
-        EngineMode::Texture => Box::new(TextureEngine::new()),
-        EngineMode::Auto => Box::new(WsolaEngine::new()),
-    };
-
-    let mut engine: Box<dyn StretchEngine> = if plan.cfg.pitch == 1.0 {
-        inner
-    } else {
-        Box::new(PitchStage::new(inner, plan.cfg.pitch))
+        EngineMode::Varispeed => Box::new(TapeEngine::new()),
+        EngineMode::ElasticPro | EngineMode::Auto => Box::new(ElasticEngine::new(ElasticPreset::Pro)),
+        EngineMode::ElasticEfficient => Box::new(ElasticEngine::new(ElasticPreset::Efficient)),
+        EngineMode::Rhythmic => Box::new(ElasticEngine::new(ElasticPreset::Rhythmic)),
+        EngineMode::Soloist => Box::new(SoloistEngine::new()),
+        EngineMode::Texture => {
+            let inner: Box<dyn StretchEngine> = Box::new(TextureEngine::new());
+            if plan.cfg.pitch == 1.0 {
+                inner
+            } else {
+                Box::new(PitchStage::new(inner, plan.cfg.pitch))
+            }
+        }
     };
     engine.prepare(&plan.cfg)?;
     Ok(engine)

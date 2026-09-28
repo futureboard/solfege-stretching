@@ -27,10 +27,10 @@ USAGE:
   solfege bench    [--mode <name>] [--block 256] [--alpha 1.5] [--json]
   solfege stability [--hz 65] [--mode <name>] [--semitones 3] [--fft 2048]
                    steadiness of a known tone through the engine
-  solfege quality  [--mode polyphonic] [--semitones 3] [--alpha 1.0] [--fft n]
+  solfege quality  [--mode elastic-pro] [--semitones 3] [--alpha 1.0] [--fft n]
                    the full-mix battery: bass, vocal, transient, tail, image
-  solfege protect  [--mode polyphonic] [--protect 12] [--alpha 1.0]
-                   does attack protect duck the level? on vs off, block by block
+  solfege protect  [--mode elastic-pro] [--alpha 1.5]
+                   does transient handling change the level? on vs off
   solfege play     --in <wav> [--alpha 1.5] [--mode auto] [--seconds 10] [--trim -2]
                    [--sweep 0.5] exercise live plan swaps every N seconds
                    (needs --features playback)
@@ -39,8 +39,9 @@ USAGE:
 RENDER OPTIONS:
   --alpha <f>          duration ratio; >1 is longer          (default 1.0)
   --semitones <f>      independent transpose                 (default 0)
-  --mode <name>        auto|bypass|tape|percussive|monophonic|polyphonic|
-                       hybrid|texture                        (default auto)
+  --mode <name>        auto|elastic-pro|elastic-efficient|rhythmic|soloist|
+                       varispeed|texture|bypass              (default auto)
+  --transients off     no transient detection or locking
   --formant <name>     follow|preserve|shift:<semitones>     (default follow)
   --quality <name>     offline|realtime                      (default offline)
   --block <n>          caller block size                     (default 1024)
@@ -200,7 +201,7 @@ fn cmd_stability(opts: &Options) -> Result<(), String> {
     };
     let modes: Vec<EngineMode> = match opts.get("mode") {
         Some(m) => vec![EngineMode::parse(m).ok_or_else(|| format!("unknown mode `{m}`"))?],
-        None => vec![EngineMode::Monophonic, EngineMode::Polyphonic, EngineMode::Hybrid],
+        None => vec![EngineMode::ElasticPro, EngineMode::ElasticEfficient, EngineMode::Soloist],
     };
     let quality = match opts.get("quality").unwrap_or("offline") {
         "offline" => QualityProfile::Offline,
@@ -226,11 +227,7 @@ fn cmd_stability(opts: &Options) -> Result<(), String> {
             let id = SourceIdentity::of(&src, rate);
             let mut doc = EditDocument::constant(id, alpha, semitones, mode);
             doc.quality = quality;
-            let opts_c = CompileOptions {
-                stft_size: fft,
-                protect_in_spectral_modes: false,
-                ..CompileOptions::default()
-            };
+            let opts_c = CompileOptions { stft_size: fft, ..CompileOptions::default() };
             let plan = match compile(&doc, None, &opts_c) {
                 Ok(p) => p,
                 Err(e) => {
@@ -306,15 +303,15 @@ fn cmd_quality(opts: &Options) -> Result<(), String> {
         .map(|v| v.parse::<usize>())
         .transpose()
         .map_err(|e| e.to_string())?;
-    let lowfft = opts
-        .get("lowfft")
-        .map(|v| v.parse::<usize>())
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let protect_s = opts.f64_or("protect", 12.0)? / 1000.0;
+    let transients = opts.get("transients") != Some("off");
     let modes: Vec<EngineMode> = match opts.get("mode") {
         Some(m) => vec![EngineMode::parse(m).ok_or_else(|| format!("unknown mode `{m}`"))?],
-        None => vec![EngineMode::Polyphonic, EngineMode::Hybrid],
+        None => vec![
+            EngineMode::ElasticPro,
+            EngineMode::ElasticEfficient,
+            EngineMode::Rhythmic,
+            EngineMode::Soloist,
+        ],
     };
     let p = 2f64.powf(semitones / 12.0);
     let secs = 3.0f64;
@@ -327,9 +324,7 @@ fn cmd_quality(opts: &Options) -> Result<(), String> {
         let a = analyze(src, rate, "quality", &AnalysisSettings::default());
         let o = CompileOptions {
             stft_size: fft,
-            low_stft_size: lowfft,
-            low_gate: opts.has("lowgate"),
-            protect_seconds: protect_s,
+            transient_protect: transients,
             ..CompileOptions::default()
         };
         let plan = compile(&doc, Some(&a), &o).map_err(|e| e.to_string())?;
@@ -522,10 +517,9 @@ fn cmd_protect(opts: &Options) -> Result<(), String> {
     let rate = 48_000u32;
     let alpha = opts.f64_or("alpha", 1.0)?;
     let semitones = opts.f64_or("semitones", 2.0)?;
-    let protect_ms = opts.f64_or("protect", 12.0)?;
     let modes: Vec<EngineMode> = match opts.get("mode") {
         Some(m) => vec![EngineMode::parse(m).ok_or_else(|| format!("unknown mode `{m}`"))?],
-        None => vec![EngineMode::Polyphonic, EngineMode::Hybrid],
+        None => vec![EngineMode::ElasticPro, EngineMode::Rhythmic],
     };
     let n = rate as usize * 3;
 
@@ -535,19 +529,19 @@ fn cmd_protect(opts: &Options) -> Result<(), String> {
         ("mixed", fixtures::mixed(n, rate, 2)),
     ];
 
-    let render = |src: &AudioBuffer, mode: EngineMode, ms: f64| -> Result<AudioBuffer, String> {
+    let render = |src: &AudioBuffer, mode: EngineMode, on: bool| -> Result<AudioBuffer, String> {
         let id = SourceIdentity::of(src, rate);
         let mut doc = EditDocument::constant(id, alpha, semitones, mode);
         doc.quality = QualityProfile::Offline;
         let a = analyze(src, rate, "protect", &AnalysisSettings::default());
-        let o = CompileOptions { protect_seconds: ms / 1000.0, ..CompileOptions::default() };
+        let o = CompileOptions { transient_protect: on, ..CompileOptions::default() };
         let plan = compile(&doc, Some(&a), &o).map_err(|e| e.to_string())?;
         let (out, _) = render_offline(&plan, src, 1024).map_err(|e| e.to_string())?;
         Ok(out)
     };
 
     println!(
-        "alpha {alpha}  ·  {semitones:+} semitones  ·  protect {protect_ms} ms vs 0 ms\n"
+        "alpha {alpha}  ·  {semitones:+} semitones  ·  transients on vs off\n"
     );
     println!(
         "{:<12} {:<12} {:>10} {:>10} {:>10} {:>10}",
@@ -556,8 +550,8 @@ fn cmd_protect(opts: &Options) -> Result<(), String> {
 
     for mode in modes {
         for (name, src) in &cases {
-            let off = render(src, mode, 0.0)?;
-            let on = render(src, mode, protect_ms)?;
+            let off = render(src, mode, false)?;
+            let on = render(src, mode, true)?;
             // Short blocks: a duck that lasts a couple of window lengths has to
             // be visible, so the block cannot be longer than the artifact.
             let win = 512usize;
@@ -625,9 +619,9 @@ fn cmd_protect(opts: &Options) -> Result<(), String> {
         "
 total = whole-render energy. hit mean/worst = energy in a -50..+150 ms"
     );
-    println!("window around each transient, protect-on minus protect-off, in dB.");
+    println!("window around each transient, transients-on minus transients-off, in dB.");
     println!(
-        "Attack Protect is a phase decision: it may move an attack, never duck one."
+        "Transient handling changes where frames are read, never a gain: it may sharpen a hit, never duck one."
     );
     Ok(())
 }
@@ -672,10 +666,7 @@ fn cmd_render(opts: &Options) -> Result<(), String> {
     let doc = build_document(&file.audio, file.sample_rate, opts)?;
 
     let t0 = Instant::now();
-    let needs_analysis = matches!(
-        doc.mode,
-        EngineMode::Auto | EngineMode::Percussive | EngineMode::Polyphonic | EngineMode::Hybrid
-    );
+    let needs_analysis = doc.mode == EngineMode::Auto;
     let analysis = if needs_analysis {
         Some(analyze(&file.audio, file.sample_rate, &doc.source.id, &AnalysisSettings::default()))
     } else {
@@ -686,9 +677,7 @@ fn cmd_render(opts: &Options) -> Result<(), String> {
     let copts = CompileOptions {
         stft_size: opts.get("fft").map(|v| v.parse::<usize>()).transpose()
             .map_err(|e: std::num::ParseIntError| e.to_string())?,
-        low_stft_size: opts.get("lowfft").map(|v| v.parse::<usize>()).transpose()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?,
-        low_gate: opts.has("lowgate"),
+        transient_protect: opts.get("transients") != Some("off"),
         ..CompileOptions::default()
     };
     let plan = compile(&doc, analysis.as_ref(), &copts).map_err(|e| e.to_string())?;
@@ -730,20 +719,12 @@ fn cmd_render(opts: &Options) -> Result<(), String> {
         if let Some(r) = &plan.auto_reason {
             println!("auto chose it {r}");
         }
+        println!("              {}", plan.mode.hint());
         if let Some(w) = plan.cfg.stft_size {
             println!(
-                "window        {w} frames ({:.1} ms) chosen from the analysis",
+                "window        {w} frames ({:.1} ms), overridden",
                 w as f64 * 1000.0 / file.sample_rate as f64
             );
-        }
-        match plan.cfg.low_stft_size {
-            Some(0) | None => {}
-            Some(w) => println!(
-                "low path      {w} frames ({:.1} ms) below {:.0}-{:.0} Hz",
-                w as f64 * 1000.0 / file.sample_rate as f64,
-                solfege::engines::pv::CROSSOVER_LO_HZ,
-                solfege::engines::pv::CROSSOVER_HI_HZ
-            ),
         }
         println!(
             "length        {} -> {} frames (expected {})",
@@ -919,17 +900,17 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
 
     // Endpoint: every mode delivers exactly M frames, at several ratios.
     for mode in [
-        EngineMode::Tape,
-        EngineMode::Monophonic,
-        EngineMode::Polyphonic,
-        EngineMode::Percussive,
-        EngineMode::Hybrid,
+        EngineMode::Varispeed,
+        EngineMode::ElasticPro,
+        EngineMode::ElasticEfficient,
+        EngineMode::Rhythmic,
+        EngineMode::Soloist,
         EngineMode::Texture,
     ] {
         let mut worst = String::new();
         let mut ok = true;
         for alpha in [0.5, 0.75, 1.0, 1.5, 2.0] {
-            let src = if mode == EngineMode::Percussive { &drums } else { &tone };
+            let src = if mode == EngineMode::Rhythmic { &drums } else { &tone };
             let id = SourceIdentity::of(src, rate);
             let mut doc = EditDocument::constant(id, alpha, 0.0, mode);
             doc.quality = QualityProfile::Offline;
@@ -969,7 +950,7 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     // Block invariance: one plan, two very different block schedules.
     {
         let id = SourceIdentity::of(&tone, rate);
-        let doc = EditDocument::constant(id, 1.5, 0.0, EngineMode::Monophonic);
+        let doc = EditDocument::constant(id, 1.5, 0.0, EngineMode::ElasticPro);
         let plan = compile(&doc, None, &CompileOptions::default()).map_err(|e| e.to_string())?;
         let (a, _) = render_offline(&plan, &tone, 1024).map_err(|e| e.to_string())?;
         let (b, _) = render_offline(&plan, &tone, 17).map_err(|e| e.to_string())?;
@@ -989,7 +970,7 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     {
         let sine = fixtures::sine(n, rate, 440.0, 0.5, 1);
         let id = SourceIdentity::of(&sine, rate);
-        let doc = EditDocument::constant(id, 1.0, 7.0, EngineMode::Polyphonic);
+        let doc = EditDocument::constant(id, 1.0, 7.0, EngineMode::ElasticPro);
         let plan = compile(&doc, None, &CompileOptions::default()).map_err(|e| e.to_string())?;
         let (out, _) = render_offline(&plan, &sine, 1024).map_err(|e| e.to_string())?;
         let expected = 440.0 * 2f64.powf(7.0 / 12.0);
@@ -1009,7 +990,7 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     // Stereo: an inverted pair must stay inverted.
     {
         let id = SourceIdentity::of(&stereo, rate);
-        let doc = EditDocument::constant(id, 1.5, 0.0, EngineMode::Polyphonic);
+        let doc = EditDocument::constant(id, 1.5, 0.0, EngineMode::ElasticPro);
         let plan = compile(&doc, None, &CompileOptions::default()).map_err(|e| e.to_string())?;
         let (out, _) = render_offline(&plan, &stereo, 1024).map_err(|e| e.to_string())?;
         let corr = metrics::channel_correlation(&out).unwrap_or(0.0);
@@ -1024,7 +1005,7 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     {
         let src = fixtures::impulse_train(n, rate as usize / 4, 1, 0);
         let id = SourceIdentity::of(&src, rate);
-        let mut doc = EditDocument::constant(id, 1.0, 0.0, EngineMode::Percussive);
+        let mut doc = EditDocument::constant(id, 1.0, 0.0, EngineMode::Rhythmic);
         let mid_src = rate as u64 / 2;
         let mid_out = mid_src + rate as u64 / 20;
         doc.anchors = vec![
@@ -1049,13 +1030,13 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     // Typed rejections rather than silent repair.
     {
         let id = SourceIdentity::of(&tone, rate);
-        let doc = EditDocument::constant(id, 1.5, 3.0, EngineMode::Tape);
+        let doc = EditDocument::constant(id, 1.5, 3.0, EngineMode::Varispeed);
         let rejected = compile(&doc, None, &CompileOptions::default()).is_err();
-        record("tape + transpose rejected", rejected, format!("rejected: {rejected}"));
+        record("varispeed + transpose rejected", rejected, format!("rejected: {rejected}"));
     }
     {
         let id = SourceIdentity::of(&tone, rate);
-        let mut doc = EditDocument::constant(id, 1.0, 0.0, EngineMode::Monophonic);
+        let mut doc = EditDocument::constant(id, 1.0, 0.0, EngineMode::Soloist);
         doc.anchors = vec![WarpAnchor::endpoint(0, 0), WarpAnchor::user(100, 50), WarpAnchor::endpoint(n as u64, n as u64)];
         doc.anchors[1].output_frame = 0; // crossed
         let rejected = doc.validate().is_err();
@@ -1063,13 +1044,11 @@ fn cmd_selftest(opts: &Options) -> Result<(), String> {
     }
     {
         let id = SourceIdentity::of(&tone, rate);
-        let mut doc = EditDocument::constant(id, 4.0, 12.0, EngineMode::Monophonic);
-        doc.quality = QualityProfile::Offline;
-        // alpha 4 x pitch 2 = an internal 8x: outside the WSOLA range even
-        // though each control is inside its own.
+        let doc = EditDocument::constant(id, 6.0, 0.0, EngineMode::Soloist);
+        // Soloist stops at 4x; the compiler says so before rendering.
         let err = compile(&doc, None, &CompileOptions::default()).err();
         let ok = matches!(err, Some(solfege::PlanError::InternalRatio { .. }));
-        record("internal ratio rejected", ok, format!("{err:?}"));
+        record("out-of-range ratio rejected", ok, format!("{err:?}"));
     }
 
     // Empty and one-frame sources.
@@ -1116,11 +1095,11 @@ fn cmd_bench(opts: &Options) -> Result<(), String> {
     let modes: Vec<EngineMode> = match opts.get("mode") {
         Some(m) => vec![EngineMode::parse(m).ok_or_else(|| format!("unknown mode `{m}`"))?],
         None => vec![
-            EngineMode::Tape,
-            EngineMode::Monophonic,
-            EngineMode::Polyphonic,
-            EngineMode::Hybrid,
-            EngineMode::Percussive,
+            EngineMode::Varispeed,
+            EngineMode::ElasticPro,
+            EngineMode::ElasticEfficient,
+            EngineMode::Rhythmic,
+            EngineMode::Soloist,
             EngineMode::Texture,
         ],
     };
@@ -1242,10 +1221,7 @@ fn cmd_play(opts: &Options) -> Result<(), String> {
     let rate = file.sample_rate;
     let doc = build_document(&file.audio, rate, opts)?;
 
-    let needs_analysis = matches!(
-        doc.mode,
-        EngineMode::Auto | EngineMode::Percussive | EngineMode::Polyphonic | EngineMode::Hybrid
-    );
+    let needs_analysis = doc.mode == EngineMode::Auto;
     let analysis = if needs_analysis {
         Some(analyze(&file.audio, rate, &doc.source.id, &AnalysisSettings::default()))
     } else {
