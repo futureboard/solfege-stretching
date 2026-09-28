@@ -46,6 +46,8 @@ const TOLERANCE: f32 = 1e-4;
 /// Formant correction is clamped to this range (log energy units).
 const FORMANT_MAX_BOOST: f32 = 18.0 * std::f32::consts::LN_10 / 10.0;
 const FORMANT_MAX_CUT: f32 = 30.0 * std::f32::consts::LN_10 / 10.0;
+/// True-envelope iterations. Most of the lift happens in the first few.
+const TRUE_ENVELOPE_ITERATIONS: usize = 8;
 
 /// Everything that may change from one frame to the next.
 #[derive(Copy, Clone, Debug)]
@@ -87,8 +89,12 @@ pub struct SpectralKernel {
     heap: BinaryHeap<u64>,
     ceps: Vec<Complex32>,
     have_prev: bool,
-    /// Cepstral lifter cut-off, in samples of quefrency.
+    /// Longest cepstral lifter cut-off, in samples of quefrency.
     lifter: usize,
+    /// This frame's lifter cut-off.
+    lifter_now: usize,
+    /// Quefrency search range for the pitch rahmonic, samples.
+    rahmonic: (usize, usize),
 }
 
 impl SpectralKernel {
@@ -101,9 +107,9 @@ impl SpectralKernel {
             .collect();
         let wsum: f64 = window.iter().map(|w| (*w as f64) * (*w as f64)).sum();
         let zero = Complex32::new(0.0, 0.0);
-        // 1.5 ms of quefrency: smooths over the harmonics of voices up to
-        // ~650 Hz while keeping the formant shape.
-        let lifter = ((sample_rate as f64 * 0.0015).round() as usize).clamp(8, n / 4);
+        // Longest lifter: 3 ms of quefrency. Each frame shortens it to fit
+        // under its own pitch period (see `envelope`).
+        let lifter = ((sample_rate as f64 * 0.003).round() as usize).clamp(8, n / 4);
         Self {
             n,
             bins,
@@ -130,6 +136,11 @@ impl SpectralKernel {
             ceps: vec![zero; bins],
             have_prev: false,
             lifter,
+            lifter_now: lifter,
+            rahmonic: (
+                ((sample_rate as f64 * 0.001) as usize).max(4),
+                ((sample_rate as f64 / 50.0) as usize).min(n / 2 - 1),
+            ),
         }
     }
 
@@ -304,17 +315,71 @@ impl SpectralKernel {
         self.have_prev = true;
     }
 
-    /// Cepstrally smoothed log energy of the input, into `log_env`.
+    /// Spectral envelope of the input (log energy), into `log_env`.
+    ///
+    /// "True envelope" (Röbel & Rodet, DAFx 2005): a cepstral lifter alone
+    /// averages the log spectrum, so between widely spaced harmonics it sags
+    /// and the formant peaks come out flattened - a correction built on it
+    /// only moves formants part of the way. Iterating `A = max(A, lifter(A))`
+    /// lifts the smooth curve until it rides on the harmonic peaks.
     fn envelope(&mut self) {
+        let bins = self.bins;
+        for b in 0..bins {
+            self.log_env[b] = (self.energy[b] + 1e-12).ln();
+        }
+        // `gain` doubles as the running target spectrum here; it is
+        // overwritten with the correction right after.
+        self.gain.copy_from_slice(&self.log_env);
+        self.lifter_now = self.lifter;
+        self.pick_lifter();
+        for iter in 0..TRUE_ENVELOPE_ITERATIONS {
+            if iter > 0 {
+                for b in 0..bins {
+                    self.gain[b] = self.gain[b].max(self.log_env[b]);
+                }
+            }
+            self.lifter_into_env();
+        }
+    }
+
+    /// Keep the lifter under the frame's pitch period.
+    ///
+    /// A voiced frame's cepstrum has a peak at the period (the first
+    /// rahmonic). A lifter that reaches it would put the harmonics
+    /// themselves into the envelope, and a formant correction built on that
+    /// drags harmonics around. So the cut-off is three quarters of the period
+    /// when a clear one is found, and the 3 ms maximum otherwise.
+    fn pick_lifter(&mut self) {
+        let bins = self.bins;
+        for b in 0..bins {
+            self.ceps[b] = Complex32::new(self.gain[b], 0.0);
+        }
+        self.fft.inverse(&self.ceps, &mut self.time);
+        let (lo, hi) = self.rahmonic;
+        let mut best = (0usize, 0.0f32);
+        let mut sum = 0.0f32;
+        for q in lo..=hi {
+            let v = self.time[q];
+            sum += v.abs();
+            if v > best.1 {
+                best = (q, v);
+            }
+        }
+        let mean = sum / (hi - lo + 1) as f32;
+        if best.0 > 0 && best.1 > 4.0 * mean {
+            self.lifter_now = (best.0 * 3 / 4).clamp(8, self.lifter);
+        }
+    }
+
+    /// `log_env = lifter(gain)`: low-quefrency part of the cepstrum only.
+    fn lifter_into_env(&mut self) {
         let n = self.n;
         let bins = self.bins;
         for b in 0..bins {
-            self.ceps[b] = Complex32::new((self.energy[b] + 1e-12).ln(), 0.0);
+            self.ceps[b] = Complex32::new(self.gain[b], 0.0);
         }
         self.fft.inverse(&self.ceps, &mut self.time);
-        // Keep the low quefrencies (both ends: the cepstrum is even), with a
-        // short taper so the lifter itself does not ring.
-        let q = self.lifter;
+        let q = self.lifter_now;
         let taper = (q / 4).max(1);
         for i in 0..n {
             let d = i.min(n - i);

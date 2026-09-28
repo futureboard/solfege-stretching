@@ -166,6 +166,8 @@ pub struct ElasticEngine {
     f_cur: f64,
     glide: f64,
     a_prev: Option<i64>,
+    /// Lock the previous frame was inside, if any.
+    lock_prev: Option<u64>,
 }
 
 impl ElasticEngine {
@@ -189,6 +191,7 @@ impl ElasticEngine {
             f_cur: 1.0,
             glide: 1.0,
             a_prev: None,
+            lock_prev: None,
         }
     }
 
@@ -241,6 +244,7 @@ impl ElasticEngine {
         self.zfin = self.window_start_for(need);
         self.z.reset(self.zfin);
         self.a_prev = None;
+        self.lock_prev = None;
         if let Some(k) = self.kernel.as_mut() {
             k.reset();
         }
@@ -372,7 +376,12 @@ impl ElasticEngine {
             sched.offer_onset(&core.cfg.map, o, t_c);
         }
 
-        let mut a = sched.position(&core.cfg.map, t_c);
+        let lock = sched.lock_at(t_c);
+        let mut a = match (self.a_prev, lock) {
+            // Inside one lock: exactly one hop on, whatever the rounding.
+            (Some(prev), Some(l)) if self.lock_prev == Some(l) => prev + hop,
+            _ => sched.position(&core.cfg.map, t_c),
+        };
         if let Some(prev) = self.a_prev {
             a = a.max(prev);
         }
@@ -395,6 +404,7 @@ impl ElasticEngine {
             |c, i, v| z.add(c, zw + i as i64, v),
         );
         self.a_prev = Some(a);
+        self.lock_prev = lock;
         self.zfin += hop;
         core.ring.discard_before(from.max(0) as u64);
         true

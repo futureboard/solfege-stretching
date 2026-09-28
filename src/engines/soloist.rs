@@ -192,6 +192,8 @@ pub struct SoloistEngine {
     fin: i64,
     /// Largest grain half-length, output frames.
     h_max: usize,
+    /// Longest period the tracker reports, source frames.
+    max_period: usize,
     unvoiced_half: usize,
     p_cur: f64,
     f_cur: f64,
@@ -222,6 +224,7 @@ impl SoloistEngine {
             prev_period: 0.0,
             fin: 0,
             h_max: 0,
+            max_period: 0,
             unvoiced_half: 0,
             p_cur: 1.0,
             f_cur: 1.0,
@@ -243,12 +246,14 @@ impl SoloistEngine {
         self.yin.as_ref().map(|y| y.w).unwrap_or(0)
     }
 
-    /// Source span one mark may touch around centre `c`.
+    /// Source span one mark may touch around centre `c`: the pitch
+    /// window, or a grain of two of the longest periods plus the lag search
+    /// around it, whichever reaches further.
     fn span(&self, c: f64) -> (i64, i64) {
         let w = self.yin_w() as i64;
-        let reach = self.h_max as i64 * 4 + 8;
-        let lo = c.floor() as i64 - w / 2 - reach;
-        let hi = c.ceil() as i64 + w / 2 + reach;
+        let reach = self.max_period as i64 * 3 + 8;
+        let lo = c.floor() as i64 - (w / 2).max(reach);
+        let hi = c.ceil() as i64 + (w / 2).max(reach);
         (lo, hi)
     }
 
@@ -418,7 +423,10 @@ impl SoloistEngine {
         sched.start_at(output_frame as f64);
         let c = sched.position(&core.cfg.map, output_frame as f64) as f64;
         let w = self.yin.as_ref().map(|y| y.w).unwrap_or(0) as i64;
-        let start = (c.floor() as i64 - w / 2 - h * 4 - 8).max(0) as u64;
+        // The first grain may snap back by up to half a period to an epoch,
+        // and later ones may repeat a period: start two periods early.
+        let reach = (w / 2).max(self.max_period as i64 * 3 + 8) + 2 * self.max_period as i64;
+        let start = (c.floor() as i64 - reach).max(0) as u64;
         core.ring.reset(start);
         core.out.reset();
         core.out.skip(h as usize);
@@ -597,7 +605,11 @@ impl Stepper for SoloistEngine {
             self.fin = new_fin;
             core.synth_pos = self.fin.clamp(0, total) as u64;
             // everything older than the span of the next grain can go
+            // The next grain may sit up to half a period *before* this one
+            // (the map can ask to repeat a period), so keep two more periods
+            // of history than this grain needed.
             let (keep, _) = self.span(self.prev_c.unwrap_or(c).min(c));
+            let keep = keep - 2 * self.max_period as i64;
             let core = self.core.as_mut().expect("prepared");
             core.ring.discard_before(keep.max(0) as u64);
         }
@@ -627,7 +639,10 @@ impl StretchEngine for SoloistEngine {
         let yin = Yin::new(cfg.sample_rate);
         // Longest grain: two periods of the lowest note, read at the lowest
         // formant rate, stretched for the lowest pitch.
-        self.h_max = (2.0 * rate / MIN_HZ * 2.0).ceil() as usize;
+        self.max_period = (rate / MIN_HZ).ceil() as usize;
+        // A grain spans one longest period either side, read at the lowest
+        // formant rate (two octaves down) in output frames.
+        self.h_max = self.max_period * 4 + 8;
         self.unvoiced_half = (rate * UNVOICED_HALF).round() as usize;
         self.grid = ((rate * 0.005).round() as i64).max(16);
         let lock_n = ((rate * 0.02).round() as usize).next_power_of_two();
@@ -672,7 +687,7 @@ impl StretchEngine for SoloistEngine {
 
     fn latency(&self) -> LatencyInfo {
         LatencyInfo {
-            lookahead_input_frames: (self.yin_w() / 2 + self.h_max * 4) as u64,
+            lookahead_input_frames: (self.yin_w() / 2).max(self.max_period * 3) as u64,
             startup_padding_input_frames: 0,
             presentation_delay_output_frames: self.h_max as u64,
             tail_output_frames: 0,

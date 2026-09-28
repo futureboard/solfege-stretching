@@ -4,13 +4,24 @@
 //!
 //! ```text
 //! control thread          worker thread                 audio callback
-//! -------------- set_plan --> compile, prepare, seek
-//!                             warm the input ring
+//! -------------- set_plan --> same mode? ------------->  retarget the running
+//!                             (new map/pitch/formant)    engine in place
+//!                        <-- retire the old maps -----   (never freed here)
+//!                             new mode? compile,
+//!                             prepare, seek, warm
 //!                             hand over a Voice ------>  swap in, crossfade
 //!                        <-- retire the old Voice ----   (never dropped here)
 //!                             keep topping up  ------->  process() under a
 //!                             the input ring             work budget
 //! ```
+//!
+//! **Retarget first.** Moving a tempo or pitch slider does not build a new
+//! engine. The Elastic modes and Soloist can take a new map, pitch and formant
+//! policy while running, keeping their phase state and source position, so
+//! the change is heard within a block and without a seam - no crossfade
+//! between two independently-phased renders of the same audio, which is what
+//! a slider move used to sound like. A new voice and a crossfade are only
+//! needed when the mode itself changes.
 //!
 //! The callback runs the DSP; the worker only feeds it. That split is what the
 //! design asks for, and it is why `prepare`, `reset` and every allocation stay
@@ -31,6 +42,7 @@
 //! have.
 
 use crate::audio::{AudioBuffer, AudioView, AudioViewMut};
+use crate::document::{EngineMode, FormantPolicy, QualityProfile};
 use crate::engines::{PreparedSeek, ProcessState, StretchEngine};
 use crate::mapping::TimeMap;
 use crate::plan::{build_engine, PlanError, RenderPlan};
@@ -128,6 +140,8 @@ pub struct StreamMetrics {
     pub starved_frames: AtomicU64,
     pub errors: AtomicU64,
     pub swaps: AtomicU64,
+    /// Plan changes applied to the running engine in place.
+    pub retargets: AtomicU64,
     /// Output frames handed to the device by the live voice.
     pub output_frame: AtomicU64,
     /// Source position the live voice is reading, for the playhead.
@@ -173,6 +187,7 @@ impl StreamMetrics {
             starved_frames: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             swaps: AtomicU64::new(0),
+            retargets: AtomicU64::new(0),
             output_frame: AtomicU64::new(0),
             source_frame: AtomicU64::new(0),
             finished: AtomicU64::new(0),
@@ -273,6 +288,7 @@ impl StreamMetrics {
         self.starved_frames.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         self.swaps.store(0, Ordering::Relaxed);
+        self.retargets.store(0, Ordering::Relaxed);
         self.finished.store(0, Ordering::Relaxed);
         self.peak_bits.store(0, Ordering::Relaxed);
         self.device_peak_bits.store(0, Ordering::Relaxed);
@@ -453,6 +469,73 @@ impl Voice {
     }
 }
 
+// ------------------------------------------------------------------ retarget
+
+/// A plan change for the running engine, built on the worker.
+///
+/// Carries two copies of the new map - one for the engine, one for the voice's
+/// playhead - because both have to be swapped in without allocating. After the
+/// swap the box holds the *old* maps and goes back to the worker to be freed.
+pub struct LiveUpdate {
+    map: TimeMap,
+    playhead_map: TimeMap,
+    pitch: f64,
+    formant: FormantPolicy,
+}
+
+/// What must match for a plan to be applied to the running engine instead of
+/// building a new one.
+#[derive(Clone, Debug, PartialEq)]
+struct RetargetKey {
+    mode: EngineMode,
+    channels: usize,
+    sample_rate: u32,
+    stft_size: Option<usize>,
+    transient_protect: bool,
+    quality: QualityProfile,
+    max_block: usize,
+}
+
+impl RetargetKey {
+    fn of(plan: &RenderPlan) -> Option<Self> {
+        let live = matches!(
+            plan.mode,
+            EngineMode::ElasticPro
+                | EngineMode::ElasticEfficient
+                | EngineMode::Rhythmic
+                | EngineMode::Soloist
+        );
+        live.then(|| Self {
+            mode: plan.mode,
+            channels: plan.cfg.channels,
+            sample_rate: plan.cfg.sample_rate,
+            stft_size: plan.cfg.stft_size,
+            transient_protect: plan.cfg.transient_protect,
+            quality: plan.cfg.quality,
+            max_block: plan.cfg.max_block,
+        })
+    }
+}
+
+impl Voice {
+    /// Apply a plan change in place. Allocation-free; on success `u` holds
+    /// the old maps.
+    fn retarget(&mut self, u: &mut LiveUpdate) -> bool {
+        match self.engine.retarget(&mut u.map, u.pitch, u.formant) {
+            Some(pos) => {
+                std::mem::swap(&mut self.map, &mut u.playhead_map);
+                self.delivered = pos;
+                self.output_frames = self.engine.output_frames();
+                if self.delivered < self.output_frames {
+                    self.finished = false;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 // -------------------------------------------------------------------- player
 
 /// A slot one thread fills and the other empties. `try_lock` never waits, so
@@ -489,6 +572,9 @@ pub struct RtPlayer {
     handoff: Arc<Slot<Voice>>,
     retire: Arc<Slot<Voice>>,
     pending_retire: Option<Box<Voice>>,
+    updates: Arc<Slot<LiveUpdate>>,
+    spent: Arc<Slot<LiveUpdate>>,
+    pending_spent: Option<Box<LiveUpdate>>,
     metrics: Arc<StreamMetrics>,
     cfg: PlayerConfig,
     /// Gain the underrun fade left behind, so the next block ramps back up
@@ -506,6 +592,8 @@ impl RtPlayer {
         cfg: PlayerConfig,
         handoff: Arc<Slot<Voice>>,
         retire: Arc<Slot<Voice>>,
+        updates: Arc<Slot<LiveUpdate>>,
+        spent: Arc<Slot<LiveUpdate>>,
         metrics: Arc<StreamMetrics>,
     ) -> Self {
         let n = cfg.max_block;
@@ -520,6 +608,9 @@ impl RtPlayer {
             handoff,
             retire,
             pending_retire: None,
+            updates,
+            spent,
+            pending_spent: None,
             metrics,
             cfg,
             gain: 1.0,
@@ -571,6 +662,38 @@ impl RtPlayer {
         }
     }
 
+    /// Apply a pending plan change to the newest voice. The used update -
+    /// now holding the old maps - is parked for the worker to free.
+    fn take_update(&mut self) {
+        if self.pending_spent.is_some() {
+            if let Ok(mut slot) = self.spent.try_lock() {
+                if slot.is_none() {
+                    *slot = self.pending_spent.take();
+                }
+            }
+            if self.pending_spent.is_some() {
+                return; // nowhere to put the old maps yet; try next block
+            }
+        }
+        let Ok(mut slot) = self.updates.try_lock() else {
+            return;
+        };
+        let Some(mut u) = slot.take() else {
+            return;
+        };
+        drop(slot);
+        let target = match self.incoming.as_mut() {
+            Some(v) => Some(v),
+            None => self.voice.as_mut(),
+        };
+        if let Some(v) = target {
+            if v.retarget(&mut u) {
+                self.metrics.retargets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.pending_spent = Some(u);
+    }
+
     /// Render `frames` of interleaved output. Anything the engines could not
     /// deliver is faded out and counted, never left as stale samples.
     pub fn fill(&mut self, out: &mut [f32], frames: usize) {
@@ -580,6 +703,7 @@ impl RtPlayer {
         self.metrics.callbacks.fetch_add(1, Ordering::Relaxed);
         self.drain_retire();
         self.take_handoff();
+        self.take_update();
 
         if self.voice.is_none() {
             return;
@@ -809,7 +933,7 @@ impl Drop for StreamHandle {
 }
 
 /// Seconds of source the prefetch worker keeps queued ahead of the engine.
-const PREFETCH_SECONDS: f64 = 0.5;
+const PREFETCH_SECONDS: f64 = 1.0;
 
 /// Start the worker and return the callback half plus its control handle.
 ///
@@ -826,12 +950,22 @@ pub fn start(
     let metrics = Arc::new(StreamMetrics::new());
     let handoff: Arc<Slot<Voice>> = Arc::new(Mutex::new(None));
     let retire: Arc<Slot<Voice>> = Arc::new(Mutex::new(None));
+    let updates: Arc<Slot<LiveUpdate>> = Arc::new(Mutex::new(None));
+    let spent: Arc<Slot<LiveUpdate>> = Arc::new(Mutex::new(None));
     let errors: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = channel();
 
     let cfg_swap_fade = cfg.swap_fade;
     let cfg_max_block = cfg.max_block;
-    let player = RtPlayer::new(channels, cfg, handoff.clone(), retire.clone(), metrics.clone());
+    let player = RtPlayer::new(
+        channels,
+        cfg,
+        handoff.clone(),
+        retire.clone(),
+        updates.clone(),
+        spent.clone(),
+        metrics.clone(),
+    );
 
     let ring_samples =
         ((sample_rate as f64 * PREFETCH_SECONDS) as usize * channels).next_power_of_two();
@@ -852,6 +986,8 @@ pub fn start(
                 rx,
                 handoff,
                 retire,
+                updates,
+                spent,
                 w_metrics,
                 w_errors,
                 channels,
@@ -878,6 +1014,8 @@ fn worker_loop(
     rx: Receiver<WorkerCmd>,
     handoff: Arc<Slot<Voice>>,
     retire: Arc<Slot<Voice>>,
+    updates: Arc<Slot<LiveUpdate>>,
+    spent: Arc<Slot<LiveUpdate>>,
     metrics: Arc<StreamMetrics>,
     errors: Arc<Mutex<Option<String>>>,
     channels: usize,
@@ -888,12 +1026,39 @@ fn worker_loop(
     let mut feeds: Vec<Feed> = Vec::new();
     let mut stage = vec![0.0f32; worker_block * channels];
     let total = source.frames() as u64;
+    // What the newest voice was built for; a plan with the same key is
+    // applied to it in place.
+    let mut current: Option<RetargetKey> = None;
 
     loop {
         // 1. commands
         match rx.try_recv() {
             Ok(WorkerCmd::Stop) | Err(TryRecvError::Disconnected) => break,
             Ok(WorkerCmd::SetPlan { plan, from_source }) => {
+                let key = RetargetKey::of(&plan);
+                if key.is_some() && key == current {
+                    let mut u = Box::new(LiveUpdate {
+                        map: plan.cfg.map.clone(),
+                        playhead_map: plan.cfg.map.clone(),
+                        pitch: plan.cfg.pitch,
+                        formant: plan.cfg.formant,
+                    });
+                    // A voice still waiting in the handoff slot is the worker's
+                    // to change directly; otherwise the callback applies it.
+                    let mut applied = false;
+                    if let Ok(mut slot) = handoff.lock() {
+                        if let Some(v) = slot.as_mut() {
+                            applied = v.retarget(&mut u);
+                        }
+                    }
+                    if !applied {
+                        if let Ok(mut slot) = updates.lock() {
+                            // latest wins; a superseded update is freed here
+                            *slot = Some(u);
+                        }
+                    }
+                    continue;
+                }
                 match make_voice(
                     &plan,
                     from_source,
@@ -904,6 +1069,7 @@ fn worker_loop(
                     preroll_cap,
                 ) {
                     Ok((mut voice, feed)) => {
+                        current = key;
                         feeds.push(feed);
                         // Warm the ring *and the engine*. Feeding and rendering
                         // alternate because the engine cannot get ahead of its
@@ -944,8 +1110,12 @@ fn worker_loop(
             fill_feed(f, &source, &mut stage, channels, worker_block);
         }
 
-        // 3. destroy retired voices here, never in the callback
+        // 3. destroy retired voices and spent updates here, never in the
+        // callback
         if let Ok(mut slot) = retire.lock() {
+            slot.take();
+        }
+        if let Ok(mut slot) = spent.lock() {
             slot.take();
         }
         feeds.retain(|f| !f.producer.orphaned());
@@ -1004,6 +1174,8 @@ fn make_voice(
     let start = engine.input_position();
     let (producer, consumer) = spsc(ring_samples);
 
+    // Never offer the engine more input per call than it was prepared for.
+    let worker_block = worker_block.min(plan.cfg.max_block.max(1));
     let voice = Box::new(Voice {
         map: plan.cfg.map.clone(),
         output_frames: engine.output_frames(),

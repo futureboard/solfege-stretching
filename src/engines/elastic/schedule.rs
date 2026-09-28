@@ -116,7 +116,7 @@ impl Scheduler {
             half: lock_span * n as f64 / 2.0,
             unity: 1.0,
             rate_dev: rate_dev.max(1.05),
-            ramp_cap: 0.35 * sample_rate as f64,
+            ramp_cap: 0.2 * sample_rate as f64,
             enabled,
             locks: VecDeque::with_capacity(64),
             last_end: f64::NEG_INFINITY,
@@ -193,6 +193,24 @@ impl Scheduler {
             d += self.carry * (1.0 - x);
         }
         d
+    }
+
+    /// The onset whose unity span contains output time `t`, if any. Two
+    /// frames inside the same lock must be read exactly one hop apart;
+    /// rounding the lock line separately for each can land on either side of
+    /// a half sample and wobble the hop, which is enough to smear the very
+    /// attack the lock is there to keep.
+    pub fn lock_at(&self, t: f64) -> Option<u64> {
+        for l in &self.locks {
+            let u = t - l.at;
+            if u < -l.half {
+                return None;
+            }
+            if u <= l.half {
+                return Some(l.onset as u64);
+            }
+        }
+        None
     }
 
     /// Integer source frame to centre the analysis frame on, for a synthesis
