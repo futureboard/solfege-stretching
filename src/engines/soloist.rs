@@ -68,6 +68,7 @@ struct Yin {
     corr: Vec<f32>,
     prefix: Vec<f64>,
     cmndf: Vec<f32>,
+    diff: Vec<f64>,
     tau_min: usize,
     tau_max: usize,
 }
@@ -90,6 +91,7 @@ impl Yin {
             corr: vec![0.0; 2 * w],
             prefix: vec![0.0; w + 1],
             cmndf: vec![1.0; tau_max + 2],
+            diff: vec![0.0; tau_max + 2],
             tau_min: ((sample_rate as f64 / MAX_HZ).floor() as usize).max(2),
             tau_max: tau_max.min(w / 2),
             fwd,
@@ -130,6 +132,7 @@ impl Yin {
             let e1 = self.prefix[w] - self.prefix[tau];
             let r = self.corr[tau] as f64 * scale as f64;
             let d = (e0 + e1 - 2.0 * r).max(0.0);
+            self.diff[tau] = d;
             run += d;
             self.cmndf[tau] = if run > 0.0 { (d * tau as f64 / run) as f32 } else { 1.0 };
         }
@@ -159,9 +162,11 @@ impl Yin {
                 best
             }
         };
-        let a = self.cmndf[tau - 1] as f64;
-        let b = self.cmndf[tau] as f64;
-        let c = self.cmndf[tau + 1] as f64;
+        // Refine on the raw difference function: the cumulative
+        // normalisation tilts the curve and biases a parabola fitted to it.
+        let a = self.diff[tau - 1];
+        let b = self.diff[tau];
+        let c = self.diff[tau + 1];
         let den = a - 2.0 * b + c;
         let shift = if den.abs() > 1e-12 { (0.5 * (a - c) / den).clamp(-0.5, 0.5) } else { 0.0 };
         Some((tau as f64 + shift, self.cmndf[tau]))
@@ -351,6 +356,36 @@ impl SoloistEngine {
         best as f64
     }
 
+    /// The frame of peak short-term energy within half a period of `c`.
+    fn epoch_near(&self, c: f64, period: f64) -> f64 {
+        let core = self.core.as_ref().expect("prepared");
+        let ch = core.cfg.channels;
+        let half = (period * 0.5).round() as i64;
+        let smooth = ((period / 16.0).round() as i64).max(1);
+        let base = c.round() as i64;
+        let energy = |i: i64| -> f64 {
+            let mut e = 0.0f64;
+            for c in 0..ch {
+                let v = core.ring.at(c, i) as f64;
+                e += v * v;
+            }
+            e
+        };
+        // running sum over a short box, slid across the search span
+        let mut acc = 0.0f64;
+        for j in -smooth..=smooth {
+            acc += energy(base - half + j);
+        }
+        let mut best = (base, f64::NEG_INFINITY);
+        for i in (base - half)..=(base + half) {
+            if acc > best.1 {
+                best = (i, acc);
+            }
+            acc += energy(i + smooth + 1) - energy(i - smooth);
+        }
+        best.0 as f64
+    }
+
     pub fn retarget(&mut self, map: &mut TimeMap, pitch: f64, formant: FormantPolicy) -> u64 {
         let (Some(core), Some(sched)) = (self.core.as_mut(), self.sched.as_mut()) else {
             return 0;
@@ -435,10 +470,11 @@ impl Stepper for SoloistEngine {
             return false;
         }
         let src_len = self.core_ref().cfg.source_frames() as i64;
-        // Grain centres sit on whole output frames; the fractional spacing
-        // accumulates in `mark`.
-        let t = self.mark.round();
-        let centre = t as i64;
+        // Grain centres keep their fractional position: rounding them to
+        // whole frames jitters the pulse train by up to half a sample, which
+        // is heard as roughness and measured as a few cents of error.
+        let t = self.mark;
+        let centre = t.round() as i64;
 
         // onsets up to the scheduler's horizon
         {
@@ -494,20 +530,32 @@ impl Stepper for SoloistEngine {
                     let n = ((ideal - pc) / tp).round();
                     if n == 0.0 { pc } else { self.refine(pc, pc + n * tp, tp) }
                 }
-                _ => ideal.round(),
+                // A new voiced run starts on an epoch: the loudest point of
+                // the period. Every later grain continues from this one by
+                // whole periods, so all of them keep the glottal pulse at
+                // their centre, where the window is 1 - and the pulse one
+                // period either side, where it is 0. Off-centre marks would
+                // carry two half-weighted pulses per grain, and a pitch change
+                // would interleave two pulse trains.
+                _ => self.epoch_near(ideal, period),
             };
-            // grain: two source periods, at least 1.5 output spacings
-            let spacing = period / p;
-            let half = period.max(0.75 * spacing * f);
-            (c, half, spacing)
+            // Grain: two source periods (one either side of the pulse),
+            // laid down one *output* period apart.
+            (c, period, period / p)
         } else {
+            // Unvoiced: short grains that tile exactly (spacing = half).
             let half = self.unvoiced_half as f64;
-            (ideal.round(), half, half)
+            (ideal.round(), half * f, half)
         };
         // Grain length in output frames: the source span read at rate f.
         let half_out = (half_src / f).min(h_max as f64 - 1.0).max(4.0);
 
-        // Overlap-add the grain, window-normalised.
+        // Plain overlap-add, not normalised by the window sum, as in
+        // classic TD-PSOLA: each glottal pulse keeps its amplitude, a higher
+        // pitch simply has more of them and a lower one has gaps between
+        // them. At the original pitch the two-period Hann grains one period
+        // apart sum to one, and with the envelope following the pitch they
+        // tile exactly at any spacing.
         {
             let core = self.core.as_mut().expect("prepared");
             let ch = core.cfg.channels;
@@ -525,14 +573,9 @@ impl Stepper for SoloistEngine {
                 }
                 let pos = c + (o as f64 - t) * f;
                 for cc in 0..ch {
-                    let v = if f == 1.0 {
-                        core.ring.at(cc, pos as i64)
-                    } else {
-                        cubic(&core.ring, cc, pos)
-                    };
+                    let v = cubic(&core.ring, cc, pos);
                     core.out.add(cc, off as usize, v * w);
                 }
-                core.out.add_norm(off as usize, w);
             }
         }
 
@@ -550,7 +593,7 @@ impl Stepper for SoloistEngine {
         if new_fin > self.fin {
             let n = (new_fin - self.fin) as usize;
             let core = self.core.as_mut().expect("prepared");
-            core.out.advance_normalized(n, 1e-3);
+            core.out.advance(n);
             self.fin = new_fin;
             core.synth_pos = self.fin.clamp(0, total) as u64;
             // everything older than the span of the next grain can go
@@ -597,10 +640,6 @@ impl StretchEngine for SoloistEngine {
         self.sched = Some(sched);
         self.detector = Some(OnsetDetector::new(cfg.channels, cfg.sample_rate));
         self.core = Some(EngineCore::new(cfg.clone(), ring, out));
-        {
-            let core = self.core.as_mut().expect("prepared");
-            core.out = crate::runtime::OutputAccum::with_norm(cfg.channels, out);
-        }
         self.glide = 1.0 - (-(rate * 0.004) / (GLIDE_SECONDS * rate)).exp();
         self.start_at(0);
         let core = self.core.as_mut().expect("prepared");

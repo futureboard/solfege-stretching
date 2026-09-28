@@ -222,10 +222,22 @@ impl SpectralKernel {
         if formant_active {
             self.envelope();
             let f = params.envelope_shift.max(1e-3);
+            let (mut before, mut after) = (0.0f64, 0.0f64);
             for k in 0..bins {
                 let target = interp(&self.log_env, k as f32 * f);
                 let d = (target - self.log_env[k]).clamp(-FORMANT_MAX_CUT, FORMANT_MAX_BOOST);
-                self.gain[k] = (0.5 * d).exp();
+                let g = (0.5 * d).exp();
+                self.gain[k] = g;
+                before += self.energy[k] as f64;
+                after += (self.energy[k] * g * g) as f64;
+            }
+            // Moving the envelope must not change the loudness: keep the
+            // frame's energy where it was.
+            if after > 1e-30 {
+                let norm = (before / after).sqrt() as f32;
+                for g in self.gain.iter_mut() {
+                    *g *= norm;
+                }
             }
         }
 
