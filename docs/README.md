@@ -25,6 +25,6 @@
 | Proposed | ข้อเสนอสำหรับ Solfege ยังไม่ได้ implement หรือ benchmark |
 | Unknown | แหล่งที่ตรวจไม่เปิดเผย หรือมีข้อมูลไม่พอสรุป |
 
-**อัปเดต 2026-09-06:** เอกสาร research/design ในชุดนี้ยังคงสถานะเดิม แต่โปรเจกต์ **ไม่ใช่ Hello World แล้ว** — ไลบรารี Rust, CLI, ชุดทดสอบ 36 ตัว และ demo egui ถูก implement ตามสัญญาในเอกสารเหล่านี้ รายละเอียดและผลวัดอยู่ใน [Implementation](implementation.md)
+**อัปเดต 2026-09-28 — Elastic rework:** engine ชุดเดิมถูกแทนด้วย **Elastic Pro / Elastic Efficient / Rhythmic** (phase vocoder แบบ phase-gradient heap integration + transient lock + stretch-then-resample) และ **Soloist** (TD-PSOLA) · การขยับ control ระหว่างเล่น **retarget engine ที่กำลังเล่นอยู่** แทนการสร้างใหม่แล้ว crossfade · architecture, time map, process contract และ stream เดิมคงไว้ทั้งหมด · ชุดทดสอบ 48 ตัว · รายละเอียดและผลวัดอยู่ใน [Implementation](implementation.md)
 
 แนวทางคือ **Rust DSP ของเราเอง มีหลายโหมดภายใต้ time map เดียว** เริ่มจาก offline renderer และตัววัดคุณภาพ (ทำแล้ว) ก่อนเพิ่มการเล่นไฟล์แบบ real-time และการแก้โน้ตร้อง (ยังไม่ทำ) ไม่อ้างว่าให้คุณภาพเทียบเท่าผลิตภัณฑ์เชิงพาณิชย์จนกว่าจะทดลองฟัง ซึ่ง **ยังไม่ได้ทำ**

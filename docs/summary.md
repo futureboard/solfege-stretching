@@ -9,7 +9,7 @@
 
 ลำดับการสร้าง: **offline WAV + CLI + measurement harness ก่อน** → แล้วค่อยเพิ่ม playback จากไฟล์ → แล้วค่อยเป็น note editor / GUI / plug-in (ซึ่งเป็นแค่ consumer ของไลบรารี ไม่ผูก DSP กับ UI framework)
 
-**สถานะจริงของโค้ดตอนนี้ (อัปเดต 2026-09-06):** implement แล้ว — ไลบรารี `solfege` (engine 7 ตัว + plan compiler + analysis + WAV IO), CLI `solfege` (render/analyze/fixtures/selftest/bench/doc), ชุดทดสอบ 36 ตัว และ demo egui ทุก correctness gate ผ่านที่ 44.1/48/96 kHz รายละเอียดและผลวัดอยู่ใน [Implementation](implementation.md) · สิ่งที่ยังไม่มีคือ note synthesis (M6), group render และ listening test
+**สถานะจริงของโค้ดตอนนี้ (อัปเดต 2026-09-28, Elastic rework):** ไลบรารี `solfege` มีโหมด **Elastic Pro, Elastic Efficient, Rhythmic, Soloist, Varispeed, Texture** + Auto/Bypass, plan compiler, analysis, WAV IO, stream ที่ **retarget engine ระหว่างเล่นได้โดยไม่สร้างใหม่**, CLI `solfege` และ demo egui · ชุดทดสอบ 48 ตัว · ทุก correctness gate ผ่าน · รายละเอียด การออกแบบ และผลวัดอยู่ใน [Implementation](implementation.md) · ส่วน §3–§8 ด้านล่างเป็นสรุปเอกสาร research/design เดิม ซึ่งยังเป็นกรอบที่ใช้อยู่ — ชื่อ engine ในตารางเก่า (WSOLA, Polyphonic, Hybrid, Percussive) ถูกแทนตาม [Implementation §0](implementation.md) · สิ่งที่ยังไม่มีคือ note synthesis (M6), group render และ listening test
 
 ## 2. ข้อเท็จจริงของ workspace ที่ตรวจแล้ว (ปิด TODO ของ system-design §1)
 
