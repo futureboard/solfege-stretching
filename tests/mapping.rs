@@ -154,7 +154,7 @@ fn document_rejects_a_map_that_does_not_cover_the_source() {
 fn document_round_trips_through_json() {
     let src = solfege::fixtures::sine(48_000, 48_000, 440.0, 0.5, 2);
     let id = SourceIdentity::of(&src, 48_000);
-    let doc = EditDocument::constant(id, 1.5, -3.0, EngineMode::Polyphonic);
+    let doc = EditDocument::constant(id, 1.5, -3.0, EngineMode::ElasticPro);
     let back = EditDocument::from_json(&doc.to_json()).unwrap();
     assert_eq!(doc, back);
     assert_eq!(doc.canonical_hash(), back.canonical_hash());
@@ -164,10 +164,10 @@ fn document_round_trips_through_json() {
 fn canonical_hash_moves_when_an_edit_moves() {
     let src = solfege::fixtures::sine(48_000, 48_000, 440.0, 0.5, 1);
     let id = SourceIdentity::of(&src, 48_000);
-    let a = EditDocument::constant(id.clone(), 1.5, 0.0, EngineMode::Polyphonic);
+    let a = EditDocument::constant(id.clone(), 1.5, 0.0, EngineMode::ElasticPro);
     let mut b = a.clone();
     b.pitch_semitones = 0.01;
     assert_ne!(a.canonical_hash(), b.canonical_hash());
-    let c = EditDocument::constant(id, 1.5, 0.0, EngineMode::Polyphonic);
+    let c = EditDocument::constant(id, 1.5, 0.0, EngineMode::ElasticPro);
     assert_eq!(a.canonical_hash(), c.canonical_hash());
 }

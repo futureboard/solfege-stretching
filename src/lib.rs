@@ -62,7 +62,7 @@ pub fn stretch_constant(
 ) -> Result<AudioBuffer, RenderError> {
     let id = SourceIdentity::of(source, sample_rate);
     let doc = EditDocument::constant(id, alpha, semitones, mode);
-    let analysis = if matches!(mode, EngineMode::Auto | EngineMode::Percussive) {
+    let analysis = if mode == EngineMode::Auto {
         Some(analysis::analyze(
             source,
             sample_rate,

@@ -11,63 +11,11 @@ use std::fmt;
 
 pub mod bypass;
 pub mod core;
-pub mod hybrid;
-pub mod lowband;
-pub mod percussive;
+pub mod elastic;
 pub mod pitch;
-pub mod pv;
+pub mod soloist;
 pub mod tape;
 pub mod texture;
-pub mod wsola;
-
-/// A source region that must not be stretched internally.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ProtectWindow {
-    pub start: u64,
-    /// Exclusive.
-    pub end: u64,
-}
-
-impl ProtectWindow {
-    pub fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start)
-    }
-    pub fn is_empty(&self) -> bool {
-        self.end <= self.start
-    }
-    pub fn contains(&self, frame: i64) -> bool {
-        frame >= self.start as i64 && frame < self.end as i64
-    }
-}
-
-/// Is `frame` inside any protected window?
-///
-/// Binary search, not a linear scan: this runs once per WSOLA search candidate,
-/// and a busy track analyses to over a thousand onsets, which turns an innocent
-/// `iter().any()` into hundreds of thousands of comparisons per frame.
-/// `windows` must be sorted and merged, which is what `merge_protections`
-/// guarantees.
-#[inline]
-pub fn protects(windows: &[ProtectWindow], frame: i64) -> bool {
-    if windows.is_empty() || frame < 0 {
-        return false;
-    }
-    let f = frame as u64;
-    let i = windows.partition_point(|w| w.start <= f);
-    i > 0 && windows[i - 1].end > f
-}
-
-/// Does any protected window *start* inside `[from, to)`? That is the question
-/// a spectral engine asks: an attack beginning inside the analysis frame is
-/// what triggers a phase reset.
-#[inline]
-pub fn protect_starts_in(windows: &[ProtectWindow], from: i64, to: i64) -> bool {
-    if windows.is_empty() || to <= from {
-        return false;
-    }
-    let lo = windows.partition_point(|w| (w.start as i64) < from);
-    lo < windows.len() && (windows[lo].start as i64) < to
-}
 
 /// Everything an engine needs, fixed for the lifetime of one prepared plan.
 #[derive(Clone, Debug)]
@@ -80,39 +28,16 @@ pub struct PreparedConfig {
     pub pitch: f64,
     pub formant: FormantPolicy,
     pub quality: QualityProfile,
-    /// Merged, sorted, in source frames.
-    pub protections: Vec<ProtectWindow>,
-    /// How long each attack is protected, in source frames.
-    ///
-    /// The spectral engines use it as a refractory period: once a transient has
-    /// been re-anchored, the next `protect_frames` are treated as still being
-    /// part of that attack rather than as new ones. Without it a long or
-    /// multi-layered hit re-anchors several times in a row, and each one is
-    /// another disagreement with the frames already written around it.
-    pub protect_frames: u64,
-    /// Is Attack Protect on at all?
-    ///
-    /// Separate from `protections` being empty, because the engines also detect
-    /// transients themselves. Zero milliseconds of protection has to mean the
-    /// whole mechanism is off - detector included - or the control has no
-    /// setting that means "leave it alone".
+    /// Transient handling on or off. The engines find transients themselves,
+    /// from the audio, so the same plan behaves the same offline and live;
+    /// this only says whether to act on them.
     pub transient_protect: bool,
     /// Largest block the caller will ever pass to `process`.
     pub max_block: usize,
     pub seed: u64,
-    /// STFT window for the spectral engines, in frames. `None` lets the engine
-    /// pick from the quality profile and the sample rate.
-    ///
-    /// Window length is a real trade, not a tuning constant: a long window
-    /// resolves bass partials that a short one smears into one bin, and blurs
-    /// the attacks a short one keeps sharp (dsp.md sec.5). Exposing it means
-    /// the choice can be measured instead of asserted.
+    /// STFT window for the spectral engines, in frames. `None` lets the
+    /// engine pick from its preset and the sample rate.
     pub stft_size: Option<usize>,
-    /// Window for the specialised low path. `Some(0)` disables the path
-    /// entirely; `None` lets the compiler decide from the material.
-    pub low_stft_size: Option<usize>,
-    /// Hand the bass back to the main engine around transients.
-    pub low_gate: bool,
 }
 
 impl PreparedConfig {
@@ -211,7 +136,7 @@ impl fmt::Display for PrepareError {
                 "pitch multiplier {requested:.4} is outside this engine's range {min}..{max}"
             ),
             PrepareError::FormantNotSupported => {
-                write!(f, "this engine has no formant path; pick Polyphonic or set FollowPitch")
+                write!(f, "this engine has no formant path; pick an Elastic mode or Soloist")
             }
             PrepareError::BlockTooLarge { requested, max } => {
                 write!(f, "block size {requested} exceeds the prepared maximum {max}")
@@ -302,6 +227,24 @@ pub trait StretchEngine: Send {
     /// would silently shift the whole source under the map. After `reset` this
     /// is where that seek landed, not zero.
     fn input_position(&self) -> u64;
+
+    /// Switch a running engine to a new map, pitch and formant without
+    /// rebuilding it, keeping its phase state and source position.
+    ///
+    /// Returns the logical output position of the next frame to be
+    /// delivered, in the new map's coordinates, or `None` if this engine
+    /// cannot be retargeted (the caller then builds a new one). On success
+    /// `map` holds the *old* map so the caller can drop it away from the
+    /// audio thread. Must not allocate or free.
+    fn retarget(
+        &mut self,
+        map: &mut TimeMap,
+        pitch: f64,
+        formant: FormantPolicy,
+    ) -> Option<u64> {
+        let _ = (map, pitch, formant);
+        None
+    }
 }
 
 /// Frames of source context an engine wants behind and ahead of the read

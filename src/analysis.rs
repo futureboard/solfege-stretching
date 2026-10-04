@@ -40,11 +40,11 @@ impl ContentClass {
     /// the choice is recorded in the plan so a render repeats (sec.6).
     pub fn suggested_mode(self) -> EngineMode {
         match self {
-            ContentClass::Silence => EngineMode::Monophonic,
-            ContentClass::Percussive => EngineMode::Percussive,
-            ContentClass::MonophonicTonal => EngineMode::Monophonic,
-            ContentClass::PolyphonicTonal => EngineMode::Polyphonic,
-            ContentClass::Mixed => EngineMode::Hybrid,
+            ContentClass::Silence => EngineMode::ElasticPro,
+            ContentClass::Percussive => EngineMode::Rhythmic,
+            ContentClass::MonophonicTonal => EngineMode::Soloist,
+            ContentClass::PolyphonicTonal => EngineMode::ElasticPro,
+            ContentClass::Mixed => EngineMode::ElasticPro,
         }
     }
     pub fn label(self) -> &'static str {

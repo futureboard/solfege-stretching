@@ -50,17 +50,40 @@ impl Default for FormantPolicy {
     }
 }
 
-/// Concrete engines plus `Auto`, which is a routing policy the user can always
-/// override, not a seventh engine (research.md sec.9).
+/// The modes a user picks from, plus `Auto`, which is a routing policy the
+/// user can always override rather than an engine of its own.
+///
+/// The lineup follows what every serious warping tool converged on - one
+/// general-purpose spectral mode, a cheaper variant, a transient-first mode, a
+/// monophonic mode, varispeed and an effect - but the implementations are this
+/// crate's own (see `engines::elastic` and `engines::soloist`).
+///
+/// Documents written before the rework used other names; they still load,
+/// through the serde aliases, onto the nearest new mode.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineMode {
+    /// Identity copy. Only valid for an edit that changes nothing.
     Bypass,
-    Tape,
-    Percussive,
-    Monophonic,
-    Polyphonic,
-    Hybrid,
+    /// General purpose, highest quality: mixes, keys, pads, vocals with
+    /// backing. Phase-gradient phase vocoder, 85 ms window, 8x overlap.
+    #[serde(alias = "polyphonic", alias = "hybrid")]
+    ElasticPro,
+    /// The same engine with a 43 ms window and 4x overlap: a quarter of the
+    /// work, slightly less bass definition.
+    ElasticEfficient,
+    /// Transients first: drums, percussive loops, rhythm parts. Short window,
+    /// every detected hit played at unity rate.
+    #[serde(alias = "percussive")]
+    Rhythmic,
+    /// One voice or one instrument line. Pitch-synchronous overlap-add:
+    /// no phasiness, and formants stay put under transposition.
+    #[serde(alias = "monophonic")]
+    Soloist,
+    /// Tape: speed and pitch move together. No independent transpose.
+    #[serde(alias = "tape")]
+    Varispeed,
+    /// Granular effect. Changes the sound on purpose.
     Texture,
     Auto,
 }
@@ -69,23 +92,49 @@ impl EngineMode {
     pub fn label(self) -> &'static str {
         match self {
             EngineMode::Bypass => "bypass",
-            EngineMode::Tape => "tape",
-            EngineMode::Percussive => "percussive",
-            EngineMode::Monophonic => "monophonic",
-            EngineMode::Polyphonic => "polyphonic",
-            EngineMode::Hybrid => "hybrid",
+            EngineMode::ElasticPro => "elastic-pro",
+            EngineMode::ElasticEfficient => "elastic-efficient",
+            EngineMode::Rhythmic => "rhythmic",
+            EngineMode::Soloist => "soloist",
+            EngineMode::Varispeed => "varispeed",
             EngineMode::Texture => "texture",
             EngineMode::Auto => "auto",
         }
     }
+    /// Human name for menus.
+    pub fn title(self) -> &'static str {
+        match self {
+            EngineMode::Bypass => "Bypass",
+            EngineMode::ElasticPro => "Elastic Pro",
+            EngineMode::ElasticEfficient => "Elastic Efficient",
+            EngineMode::Rhythmic => "Rhythmic",
+            EngineMode::Soloist => "Soloist",
+            EngineMode::Varispeed => "Varispeed",
+            EngineMode::Texture => "Texture (FX)",
+            EngineMode::Auto => "Auto",
+        }
+    }
+    /// One line on what the mode is for.
+    pub fn hint(self) -> &'static str {
+        match self {
+            EngineMode::Bypass => "no processing",
+            EngineMode::ElasticPro => "anything: full mixes, keys, pads, vocals with backing",
+            EngineMode::ElasticEfficient => "same as Pro at a quarter of the CPU",
+            EngineMode::Rhythmic => "drums, loops, anything where the hit matters most",
+            EngineMode::Soloist => "one voice or instrument: vocals, bass, lead lines",
+            EngineMode::Varispeed => "tape: pitch follows speed",
+            EngineMode::Texture => "granular effect",
+            EngineMode::Auto => "pick from the analysis",
+        }
+    }
     pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
+        Some(match s.to_ascii_lowercase().replace('_', "-").as_str() {
             "bypass" => EngineMode::Bypass,
-            "tape" => EngineMode::Tape,
-            "percussive" | "slicing" => EngineMode::Percussive,
-            "monophonic" | "wsola" => EngineMode::Monophonic,
-            "polyphonic" | "pv" => EngineMode::Polyphonic,
-            "hybrid" => EngineMode::Hybrid,
+            "elastic-pro" | "elastic" | "pro" | "polyphonic" | "pv" | "hybrid" => EngineMode::ElasticPro,
+            "elastic-efficient" | "efficient" => EngineMode::ElasticEfficient,
+            "rhythmic" | "percussive" | "slicing" | "drums" => EngineMode::Rhythmic,
+            "soloist" | "monophonic" | "solo" | "wsola" => EngineMode::Soloist,
+            "varispeed" | "tape" | "speed" => EngineMode::Varispeed,
             "texture" => EngineMode::Texture,
             "auto" => EngineMode::Auto,
             _ => return None,
@@ -93,14 +142,18 @@ impl EngineMode {
     }
     pub const ALL: [EngineMode; 8] = [
         EngineMode::Auto,
-        EngineMode::Bypass,
-        EngineMode::Tape,
-        EngineMode::Percussive,
-        EngineMode::Monophonic,
-        EngineMode::Polyphonic,
-        EngineMode::Hybrid,
+        EngineMode::ElasticPro,
+        EngineMode::ElasticEfficient,
+        EngineMode::Rhythmic,
+        EngineMode::Soloist,
+        EngineMode::Varispeed,
         EngineMode::Texture,
+        EngineMode::Bypass,
     ];
+    /// Can this mode transpose independently of time?
+    pub fn independent_pitch(self) -> bool {
+        !matches!(self, EngineMode::Varispeed | EngineMode::Bypass)
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

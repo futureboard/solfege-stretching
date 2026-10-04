@@ -282,7 +282,8 @@ struct DemoApp {
     quality: QualityProfile,
     block: usize,
     seed: u64,
-    protect_ms: f64,
+    /// Transient handling: detection plus unity-rate locks around attacks.
+    transients: bool,
 
     // time map
     anchors: Vec<WarpAnchor>,
@@ -339,7 +340,7 @@ impl DemoApp {
             quality: QualityProfile::Offline,
             block: 1024,
             seed: 0,
-            protect_ms: 6.0,
+            transients: true,
             anchors: Vec::new(),
             drag_anchor: None,
             warp_enabled: true,
@@ -453,13 +454,8 @@ impl DemoApp {
     fn compile_options(&self) -> CompileOptions {
         CompileOptions {
             max_block: 8192,
-            protect_seconds: self.protect_ms / 1000.0,
-            protect_in_spectral_modes: true,
-            // Both windows and whether the low path runs at all are decided
-            // from the analysis; the demo does not second-guess them.
+            transient_protect: self.transients,
             stft_size: None,
-            low_stft_size: None,
-            low_gate: false,
         }
     }
 
@@ -522,7 +518,7 @@ impl DemoApp {
                         a.class.label(),
                         a.onsets.len(),
                         a.notes.len(),
-                        a.class.suggested_mode().label()
+                        a.class.suggested_mode().title()
                     );
                     self.status_is_error = false;
                     self.analysis = Some(Arc::from(*a));
@@ -549,8 +545,8 @@ impl DemoApp {
                         secs / (ms / 1000.0).max(1e-9)
                     );
                     self.plan_line = match auto_reason {
-                        Some(r) => format!("engine {} — auto chose it: {r}", mode.label()),
-                        None => format!("engine {}", mode.label()),
+                        Some(r) => format!("engine {} — auto chose it: {r}", mode.title()),
+                        None => format!("engine {} — {}", mode.title(), mode.hint()),
                     };
                     self.status = "render complete".into();
                     self.status_is_error = false;
@@ -651,8 +647,8 @@ impl DemoApp {
     /// had anything to go on.
     fn describe(&self, plan: &RenderPlan) -> String {
         match &plan.auto_reason {
-            Some(r) => format!("engine {} — auto chose it: {r}", plan.mode.label()),
-            None => format!("engine {}", plan.mode.label()),
+            Some(r) => format!("engine {} — auto chose it: {r}", plan.mode.title()),
+            None => format!("engine {} — {}", plan.mode.title(), plan.mode.hint()),
         }
     }
 
@@ -696,14 +692,17 @@ impl DemoApp {
         self.live_line.clear();
     }
 
-    /// Push the edited plan to a running stream. The worker compiles and warms
-    /// a new voice; the callback crossfades it in, keeping the source position
-    /// so the playhead does not jump.
+    /// Push the edited plan to a running stream.
+    ///
+    /// Within one mode the running engine is retargeted in place - new map,
+    /// pitch and formant, same phase state and source position - so this can
+    /// follow a slider while it is being dragged. Only a mode change builds a
+    /// new engine, which the callback crossfades in.
     fn push_plan_if_dirty(&mut self) {
         if !self.plan_dirty || self.playing != Playing::Live {
             return;
         }
-        if self.last_swap.elapsed() < std::time::Duration::from_millis(120) {
+        if self.last_swap.elapsed() < std::time::Duration::from_millis(40) {
             return;
         }
         let Some(session) = self.session.as_ref() else { return };
@@ -713,7 +712,7 @@ impl DemoApp {
                 self.plan_line = self.describe(&plan);
                 let handle = &self.session.as_ref().expect("checked above").handle;
                 handle.set_plan(plan, at);
-                self.status = "swapped the plan live".into();
+                self.status = "live".into();
                 self.status_is_error = false;
             }
             Err(e) => {
@@ -756,12 +755,13 @@ impl DemoApp {
             String::new()
         };
         self.live_line = format!(
-            "live · p99 {:.2} ms (max {:.2}) · underruns {} · starved {} · swaps {} · engine {:+.1} dBFS → device {:+.1} dBFS{} · source {:.2}s",
+            "live · p99 {:.2} ms (max {:.2}) · underruns {} · starved {} · changes {} in place, {} rebuilt · engine {:+.1} dBFS → device {:+.1} dBFS{} · source {:.2}s",
             m.quantile_ms(0.99),
             m.max_ms(),
             under,
             m.starved_frames.load(Ordering::Relaxed),
-            m.swaps.load(Ordering::Relaxed),
+            m.retargets.load(Ordering::Relaxed),
+            m.swaps.load(Ordering::Relaxed).saturating_sub(1),
             db(peak),
             db(device_peak),
             clip_note,
@@ -961,6 +961,23 @@ impl eframe::App for DemoApp {
             );
 
             ui.add_space(8.0);
+            ui.label(egui::RichText::new("MODE").size(11.0).color(TEXT_DIM));
+            egui::ComboBox::from_id_salt("mode")
+                .selected_text(self.mode.title())
+                .width(268.0)
+                .show_ui(ui, |ui| {
+                    for m in EngineMode::ALL {
+                        let r = ui
+                            .selectable_value(&mut self.mode, m, m.title())
+                            .on_hover_text(m.hint());
+                        if r.clicked() {
+                            self.plan_dirty = true;
+                        }
+                    }
+                });
+            ui.label(egui::RichText::new(self.mode.hint()).size(10.0).color(TEXT_DIM));
+
+            ui.add_space(8.0);
             ui.label(egui::RichText::new("TIME AND PITCH").size(11.0).color(TEXT_DIM));
             if ui
                 .checkbox(&mut self.warp_enabled, "warp (time map)")
@@ -984,7 +1001,7 @@ impl eframe::App for DemoApp {
                     warp_on,
                     egui::Slider::new(&mut alpha, 0.25..=4.0)
                         .logarithmic(true)
-                        .text("alpha (duration)"),
+                        .text("length ×"),
                 )
                 .changed()
             {
@@ -992,99 +1009,116 @@ impl eframe::App for DemoApp {
                 self.apply_alpha();
                 self.plan_dirty = true;
             }
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("tempo {:.1}%", 100.0 / self.alpha))
+                        .size(11.0)
+                        .color(TEXT_DIM),
+                );
+                for (label, a) in [("50%", 2.0), ("75%", 4.0 / 3.0), ("100%", 1.0), ("125%", 0.8), ("150%", 2.0 / 3.0)] {
+                    if ui.add_enabled(warp_on, egui::Button::new(label).small()).clicked() {
+                        self.alpha = a;
+                        self.apply_alpha();
+                        self.plan_dirty = true;
+                    }
+                }
+            });
+            let pitch_ok = self.mode.independent_pitch();
             if ui
-                .add(
+                .add_enabled(
+                    pitch_ok,
                     egui::Slider::new(&mut self.semitones, -12.0..=12.0)
-                        .text("transpose (semitones)"),
+                        .step_by(0.01)
+                        .text("transpose (st)"),
                 )
                 .changed()
             {
                 self.plan_dirty = true;
             }
             ui.horizontal(|ui| {
-                if ui.small_button("-12").clicked() {
-                    self.semitones = -12.0;
-                }
-                if ui.small_button("-7").clicked() {
-                    self.semitones = -7.0;
-                }
-                if ui.small_button("0").clicked() {
-                    self.semitones = 0.0;
-                }
-                if ui.small_button("+7").clicked() {
-                    self.semitones = 7.0;
-                }
-                if ui.small_button("+12").clicked() {
-                    self.semitones = 12.0;
-                }
-            });
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("ENGINE").size(11.0).color(TEXT_DIM));
-            egui::ComboBox::from_id_salt("mode")
-                .selected_text(self.mode.label())
-                .width(268.0)
-                .show_ui(ui, |ui| {
-                    for m in EngineMode::ALL {
-                        if ui.selectable_value(&mut self.mode, m, m.label()).clicked() {
-                            self.plan_dirty = true;
-                        }
-                    }
-                });
-            egui::ComboBox::from_id_salt("formant")
-                .selected_text(match self.formant_kind {
-                    1 => "formants: preserve",
-                    2 => "formants: shift",
-                    _ => "formants: follow pitch",
-                })
-                .width(268.0)
-                .show_ui(ui, |ui| {
-                    let a = ui.selectable_value(&mut self.formant_kind, 0, "follow pitch (f = p)");
-                    let b = ui.selectable_value(&mut self.formant_kind, 1, "preserve (f = 1)");
-                    let c = ui.selectable_value(&mut self.formant_kind, 2, "shift by semitones");
-                    if a.clicked() || b.clicked() || c.clicked() {
+                for (label, st) in [("-12", -12.0), ("-7", -7.0), ("-1", -1.0), ("0", 0.0), ("+1", 1.0), ("+7", 7.0), ("+12", 12.0)] {
+                    if ui.add_enabled(pitch_ok, egui::Button::new(label).small()).clicked() {
+                        self.semitones = st;
                         self.plan_dirty = true;
                     }
-                });
-            if self.formant_kind == 2
-                && ui
-                    .add(
-                        egui::Slider::new(&mut self.formant_shift, -12.0..=12.0)
-                            .text("formant shift"),
-                    )
-                    .changed()
-            {
-                self.plan_dirty = true;
+                }
+            });
+            if !pitch_ok && self.mode == EngineMode::Varispeed {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "varispeed: pitch follows speed ({:+.2} st)",
+                        -12.0 * self.alpha.log2()
+                    ))
+                    .size(10.0)
+                    .color(ANCHOR_USER),
+                );
+                if self.semitones != 0.0 {
+                    self.semitones = 0.0;
+                    self.plan_dirty = true;
+                }
             }
-            ui.horizontal(|ui| {
-                let a = ui.selectable_value(&mut self.quality, QualityProfile::Offline, "offline");
-                let b = ui.selectable_value(&mut self.quality, QualityProfile::Realtime, "realtime");
-                if a.clicked() || b.clicked() {
+
+            let formant_ok = solfege::plan::capability_of(self.mode).formant_control
+                || self.mode == EngineMode::Auto;
+            ui.add_enabled_ui(formant_ok, |ui| {
+                egui::ComboBox::from_id_salt("formant")
+                    .selected_text(match self.formant_kind {
+                        1 => "formants: preserve",
+                        2 => "formants: shift",
+                        _ => "formants: follow pitch",
+                    })
+                    .width(268.0)
+                    .show_ui(ui, |ui| {
+                        let a = ui.selectable_value(&mut self.formant_kind, 0, "follow pitch (like tape)");
+                        let b = ui.selectable_value(&mut self.formant_kind, 1, "preserve (natural voice)");
+                        let c = ui.selectable_value(&mut self.formant_kind, 2, "shift by semitones");
+                        if a.clicked() || b.clicked() || c.clicked() {
+                            self.plan_dirty = true;
+                        }
+                    });
+                if self.formant_kind == 2
+                    && ui
+                        .add(
+                            egui::Slider::new(&mut self.formant_shift, -12.0..=12.0)
+                                .text("formant shift"),
+                        )
+                        .changed()
+                {
                     self.plan_dirty = true;
                 }
             });
+            if !formant_ok && self.formant_kind != 0 {
+                self.formant_kind = 0;
+                self.plan_dirty = true;
+            }
             if ui
-                .add(
-                    egui::Slider::new(&mut self.protect_ms, 0.0..=40.0)
-                        .text("attack protect (ms)"),
+                .checkbox(&mut self.transients, "keep transients sharp")
+                .on_hover_text(
+                    "Plays each detected attack at its original rate and makes up the time \
+                     around it, so hits stay crisp and land on the map. Changes where frames \
+                     are read, never a gain.",
                 )
                 .changed()
             {
                 self.plan_dirty = true;
             }
-            ui.label(
-                egui::RichText::new(
-                    "0 = off. Phase only: it re-anchors transients, never touches gain. Longer treats more of a hit as one attack, so it is smoother and softer.",
-                )
-                .size(10.0)
-                .color(TEXT_DIM),
-            );
-            ui.horizontal(|ui| {
-                ui.label("block");
-                ui.add(egui::DragValue::new(&mut self.block).range(1..=8192));
-                ui.label("seed");
-                ui.add(egui::DragValue::new(&mut self.seed).range(0..=u64::MAX));
-            });
+            egui::CollapsingHeader::new(egui::RichText::new("advanced").size(11.0).color(TEXT_DIM))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let a = ui.selectable_value(&mut self.quality, QualityProfile::Offline, "offline");
+                        let b = ui.selectable_value(&mut self.quality, QualityProfile::Realtime, "realtime");
+                        if a.clicked() || b.clicked() {
+                            self.plan_dirty = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("render block");
+                        ui.add(egui::DragValue::new(&mut self.block).range(1..=8192));
+                        ui.label("seed");
+                        ui.add(egui::DragValue::new(&mut self.seed).range(0..=u64::MAX));
+                    });
+                });
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -1095,6 +1129,7 @@ impl eframe::App for DemoApp {
                 }
                 if ui.button("Reset map").clicked() {
                     self.reset_anchors();
+                    self.plan_dirty = true;
                 }
             });
             ui.horizontal(|ui| {
@@ -1138,7 +1173,7 @@ impl eframe::App for DemoApp {
             }
             ui.label(
                 egui::RichText::new(
-                    "live streams through the engine in the audio callback; moving a control swaps the plan without stopping. Renders are never normalised, and both phase propagation and overlap-add can push a peak above the source's, so the clip guard trims the monitor only.",
+                    "▶ live runs the engine in the audio callback. Moving a control retargets the running engine in place - no rebuild, no crossfade; only a mode change builds a new one. Renders are never normalised; the clip guard trims the monitor only.",
                 )
                 .size(10.0)
                 .color(TEXT_DIM),
@@ -1181,6 +1216,7 @@ impl eframe::App for DemoApp {
                         }
                         self.anchors.dedup_by_key(|a| a.source_frame);
                         self.repair_anchors();
+                        self.plan_dirty = true;
                     }
                 }
                 if ui
@@ -1217,6 +1253,7 @@ impl eframe::App for DemoApp {
                         {
                             self.anchors[i].output_frame = out;
                             self.repair_anchors();
+                            self.plan_dirty = true;
                         }
                         if !is_end && ui.small_button("×").clicked() {
                             remove = Some(i);
@@ -1226,6 +1263,7 @@ impl eframe::App for DemoApp {
             });
             if let Some(i) = remove {
                 self.anchors.remove(i);
+                self.plan_dirty = true;
             }
         });
 
@@ -1367,6 +1405,9 @@ impl eframe::App for DemoApp {
                         * total_out as f64;
                     self.anchors[i].output_frame = f.round() as u64;
                     self.repair_anchors();
+                    // Live streams follow the drag: each update retargets
+                    // the running engine in place.
+                    self.plan_dirty = true;
                 }
             }
             if resp2.drag_stopped() {
